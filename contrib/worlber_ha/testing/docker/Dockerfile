@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Worlber PostgreSQL + worlber_ha test image.
 #
 # Build from the repository root (docker compose does this for you):
@@ -23,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential bison flex perl pkg-config \
         libreadline-dev zlib1g-dev libssl-dev liblz4-dev libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
-COPY . /src
+COPY --exclude=contrib/worlber_ha/agent --exclude=contrib/worlber_ha/testing . /src
 WORKDIR /build
 RUN /src/configure --prefix=/usr/local/pgsql --with-openssl --with-lz4 --with-zstd --without-icu \
         --with-system-tzdata=/usr/share/zoneinfo >/dev/null \

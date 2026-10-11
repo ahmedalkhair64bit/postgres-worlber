@@ -373,11 +373,32 @@ func (a *Agent) removeNode(ctx context.Context, name string) (opResult, error) {
 		return opResult{}, errHint("Run worlber_ha.switchover() to another node first.", "cannot remove the primary %q", name)
 	}
 	if name == a.cfg.Name {
-		// hand leadership to another node first; the new leader removes us
+		// A leader cannot remove itself: hand leadership to another node and
+		// let the new leader do the removal.
+		a.opMu.Unlock()
+		defer a.opMu.Lock()
 		if err := a.raft.LeadershipTransfer().Error(); err != nil {
 			return opResult{}, fmt.Errorf("leadership transfer: %w", err)
 		}
-		return opResult{}, errHint("Run remove_node() again.", "this agent was the Raft leader; leadership has been transferred")
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, id := a.raft.LeaderWithID(); id != "" && string(id) != a.cfg.Name {
+				break
+			}
+			if time.Now().After(deadline) {
+				return opResult{}, fmt.Errorf("no new Raft leader after leadership transfer")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		addr, err := a.leaderAPI()
+		if err != nil {
+			return opResult{}, err
+		}
+		var rep reply
+		if err := a.peerPostTimeout(ctx, addr, "/peer/op/remove_node", map[string]string{"name": name}, &rep, 60*time.Second); err != nil {
+			return opResult{}, err
+		}
+		return opResult{Result: rep.Result, Warnings: rep.Warnings}, nil
 	}
 	if err := a.apply(fsm.Command{Op: "remove_node", Name: name}); err != nil {
 		return opResult{}, err
