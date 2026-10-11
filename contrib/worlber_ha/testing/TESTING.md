@@ -52,6 +52,8 @@ It prints `PASS`/`FAIL` per check and ends with `== RESULT: N passed, 0 failed`.
 ./lab.sh start pg1         # node comes back, rejoins automatically
 ./lab.sh isolate pg2       # network partition of one node
 ./lab.sh heal pg2
+./lab.sh monitor           # health_check, cluster_status, replication queues, blocking, events
+./lab.sh agentlog pg2      # agent log of pg2, read through SQL (worlber_ha.agent_log)
 ./lab.sh logs pg2          # agent log (decisions: failover, rewind, fencing...)
 ./lab.sh pglog pg2         # PostgreSQL server log
 ./lab.sh witness           # start an optional 4th agent as witness, then:
@@ -66,7 +68,11 @@ From the docker host you can connect to the nodes with ports 5441, 5442 and
 psql "postgresql://postgres:postgres@localhost:5441,localhost:5442,localhost:5443/postgres?target_session_attrs=read-write"
 ```
 
-That URI always lands on the current primary, so you can use it to test how an
+Easier: use the built-in listener: `psql -h localhost -p 5000 -U postgres`
+always reaches the primary, and `-p 5001` reaches a replica (read-only). Inside
+the lab network, the VIP `172.28.0.100:5432` always points at the primary.
+
+The multi-host URI above also always lands on the current primary, so you can use it to test how an
 application reconnects during a failover. For example, keep this loop running
 while you `./lab.sh kill` the primary:
 
