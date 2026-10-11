@@ -10,6 +10,8 @@
 #   ./lab.sh start <node>       start a stopped/killed node again
 #   ./lab.sh isolate <node>     cut a node off the network (partition)
 #   ./lab.sh heal <node>        reconnect an isolated node
+#   ./lab.sh monitor            health check, replication/redo queues, blocking, events
+#   ./lab.sh agentlog [node]    agent log of a node, read through SQL
 #   ./lab.sh logs <node>        follow agent logs of a node
 #   ./lab.sh pglog <node>       follow PostgreSQL log of a node
 #   ./lab.sh test               run the full automated failover test suite
@@ -32,6 +34,13 @@ TIMEOUT=${LAB_FAILOVER_TIMEOUT:-10}
 dc() { docker compose -f "$COMPOSE" "$@"; }
 cid() { dc ps -aq "$1"; }
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$(cid "$1")" 2>/dev/null)" = true ]; }
+
+# viapg <client node> <host> <port> <query>: connect over TCP (listener, VIP)
+viapg() {
+    local node=$1 host=$2 port=$3; shift 3
+    dc exec -T -u postgres -e PGPASSWORD=postgres "$node" \
+        psql -X -qAt -h "$host" -p "$port" -U postgres -d postgres -v ON_ERROR_STOP=1 -c "$*"
+}
 
 # sql <node> <query>: run a query, unaligned output
 sql() {
@@ -106,6 +115,21 @@ cmd_status() {
     return 1
 }
 
+cmd_monitor() {
+    local n=${1:-$(primary)}
+    n=${n:-pg1}
+    local q
+    for q in \
+        "SELECT * FROM worlber_ha.health_check()" \
+        "SELECT node, role, state, sync, sync_state, timeline, lag_bytes, raft_role, agent_status FROM worlber_ha.cluster_status" \
+        "SELECT node, sync_state, log_send_queue, redo_queue, write_lag, flush_lag, replay_lag FROM worlber_ha.replication" \
+        "SELECT pid, reason, blocked_by, waiting_for, query FROM worlber_ha.blocking" \
+        "SELECT event_time, kind, node, detail FROM worlber_ha.events LIMIT 15"; do
+        echo "-- $q"
+        dc exec -T -u postgres "$n" psql -X -c "$q" || true
+    done
+}
+
 cmd_psql() {
     local node=${1:-$(primary)}
     node=${node:-pg1}
@@ -164,6 +188,46 @@ cmd_test() {
     check "rows replicated to pg3" wait_until 30 "pg3 has 1000 rows" count_is pg3 1000
     check "replicas are read-only" bash -c "! docker compose -f '$COMPOSE' exec -T -u postgres pg2 psql -X -c 'INSERT INTO lab_test VALUES (0)' >/dev/null 2>&1"
 
+    echo; echo "== 1b. synchronous replication"
+    sql pg1 "SET synchronous_commit = remote_apply; INSERT INTO lab_test VALUES (1001, 'remote_apply')"
+    check "remote_apply: row visible on sync replica pg2 immediately after COMMIT" \
+        test "$(sql pg2 "SELECT count(*) FROM lab_test WHERE id = 1001")" = 1
+    check "health_check reports a healthy cluster" test "$(anysql "SELECT string_agg(severity, ',') FROM worlber_ha.health_check()")" = OK
+    check "replication view lists both standbys" test "$(anysql "SELECT string_agg(node || ':' || sync_state, ',' ORDER BY node) FROM worlber_ha.replication")" = "pg2:quorum,pg3:async"
+    check "join of pg2 is in the event log" wait_until 10 "seeding events" test "$(anysql "SELECT count(*) FROM worlber_ha.events WHERE node = 'pg2' AND kind IN ('seeding_started', 'seeding_completed')")" = 2
+    check "agent log of pg2 readable from SQL" test "$(sql pg1 "SELECT count(*) > 0 FROM worlber_ha.agent_log('pg2', 200) WHERE message LIKE '%base backup%'")" = t
+
+    echo "-- strict mode: commits wait while the sync replica is down"
+    sql pg1 "SELECT worlber_ha.set_config('synchronous_mode', 'strict')" >/dev/null
+    sleep 2
+    dc stop pg2 >/dev/null
+    rm -f /tmp/worlber_lab_strict
+    ( sql pg1 "INSERT INTO lab_test VALUES (1002, 'strict')" >/dev/null 2>&1; echo done > /tmp/worlber_lab_strict ) &
+    sleep 4
+    check "strict: commit is blocked while pg2 is down" test ! -e /tmp/worlber_lab_strict
+    check "blocking view shows the waiting commit" \
+        test "$(sql pg1 "SELECT count(*) FROM worlber_ha.blocking WHERE reason = 'commit waiting for synchronous replica'")" = 1
+    check "health_check flags the sync replica" wait_until 20 "health CRITICAL for pg2" bash -c "docker compose -f '$COMPOSE' exec -T -u postgres pg1 psql -XAt -c \"SELECT severity FROM worlber_ha.health_check() WHERE node = 'pg2'\" | grep -q CRITICAL"
+    dc start pg2 >/dev/null
+    check "strict: commit completes when pg2 is back" wait_until 90 "blocked commit finished" test -e /tmp/worlber_lab_strict
+    check "strict: committed row reached pg2" wait_until 30 "row on pg2" test "$(sql pg2 "SELECT count(*) FROM lab_test WHERE id = 1002" 2>/dev/null)" = 1
+    wait
+    sql pg1 "SELECT worlber_ha.set_config('synchronous_mode', 'available')" >/dev/null
+    wait_until 60 "pg2 synchronous again" test "$(anysql "SELECT sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'")" = quorum || true
+
+    echo "-- available mode: commits continue when the sync replica is down"
+    dc stop pg2 >/dev/null
+    check "available: commits continue without pg2" wait_until 20 "insert ok" timeout 3 docker compose -f "$COMPOSE" exec -T -u postgres pg1 psql -X -qAt -c "INSERT INTO lab_test VALUES (1003, 'available')"
+    dc start pg2 >/dev/null
+    check "pg2 back and synchronous" wait_until 90 "pg2 quorum" test "$(anysql "SELECT state || ':' || sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'")" = "streaming:quorum"
+    sql pg1 "DELETE FROM lab_test WHERE id > 1000"
+
+    echo; echo "== 1c. listener and VIP"
+    check "listener 5000 on pg3 reaches the primary" test "$(viapg pg3 pg3 5000 "SELECT pg_is_in_recovery()")" = f
+    check "listener 5001 on pg3 reaches a replica" test "$(viapg pg3 pg3 5001 "SELECT pg_is_in_recovery()")" = t
+    check "VIP is on pg1" wait_until 20 "VIP on pg1" dc exec -T pg1 sh -c "ip -o addr show eth0 | grep -q 172.28.0.100"
+    check "VIP reaches the primary" test "$(viapg pg3 172.28.0.100 5432 "SELECT pg_is_in_recovery()")" = f
+
     echo; echo "== 2. planned switchover pg1 -> pg2 (requested on pg3)"
     sql pg3 "SELECT worlber_ha.switchover('pg2')"
     check "pg2 became primary" wait_until 60 "pg2 primary" is_role pg2 primary running
@@ -178,18 +242,25 @@ cmd_test() {
     new=$(primary)
     echo "  new primary: $new"
     check "no committed rows lost" count_is "$new" 2000
+    check "VIP moved to the new primary $new" wait_until 30 "VIP on $new" dc exec -T "$new" sh -c "ip -o addr show eth0 | grep -q 172.28.0.100"
+    check "VIP reaches the new primary" wait_until 30 "VIP rw" test "$(viapg pg3 172.28.0.100 5432 "SELECT pg_is_in_recovery()" 2>/dev/null)" = f
+    n=pg3; [ "$new" = pg3 ] && n=pg1
+    check "listener on $n follows the new primary" wait_until 30 "listener rw" test "$(viapg "$n" "$n" 5000 "SELECT pg_is_in_recovery()" 2>/dev/null)" = f
+    check "failover recorded in events" test "$(anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'automatic_failover'")" = t
     sql "$new" "INSERT INTO lab_test SELECT g, '$new' FROM generate_series(2001, 3000) g"
 
     echo; echo "== 4. crashed node pg2 comes back and rejoins"
     dc start pg2 >/dev/null
     check "pg2 rejoined as replica" wait_until 120 "pg2 streaming" is_role pg2 replica streaming
     check "pg2 caught up" wait_until 30 "pg2 has 3000 rows" count_is pg2 3000
+    check "rejoin of pg2 is in the event log" test "$(anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE node = 'pg2' AND kind IN ('rewind_completed', 'seeding_completed')")" = t
 
     echo; echo "== 5. network partition: isolate the primary ($new)"
     old=$new
     cmd_isolate "$old"
     check "isolated primary fenced itself (PostgreSQL stopped)" wait_until "$t" "$old fenced" pg_down_on "$old"
     check "majority elected a new primary" wait_until "$t" "new primary" has_new_primary "$old"
+    check "fencing recorded in events" wait_until 30 "fenced event" test "$(anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'fenced' AND node = '$old'")" = t
     new=$(primary)
     echo "  new primary: $new"
     sql "$new" "INSERT INTO lab_test SELECT g, '$new' FROM generate_series(3001, 4000) g"
@@ -215,8 +286,8 @@ cmd_test() {
     for n in "${NODES[@]}"; do
         check "$n has all 4000 rows" wait_until 30 "$n count" count_is "$n" 4000
     done
-    echo; cmd_status || true
-    echo; anysql "SELECT event_time, kind, node, epoch, detail FROM worlber_ha.events ORDER BY seq" || true
+    check "health_check is OK at the end" wait_until 60 "health OK" test "$(anysql "SELECT string_agg(severity, ',') FROM worlber_ha.health_check()")" = OK
+    echo; cmd_monitor || true
     echo
     echo "== RESULT: $PASS passed, $FAIL failed"
     [ "$FAIL" -eq 0 ]
@@ -233,10 +304,14 @@ case "${1:-help}" in
     start) dc start "$2" ;;
     isolate) cmd_isolate "$2" ;;
     heal) cmd_heal "$2" ;;
+    monitor) cmd_monitor "${2:-}" ;;
+    agentlog)
+        p=$(primary); arg=NULL; [ -n "${2:-}" ] && arg="'$2'"
+        dc exec -T -u postgres "${p:-pg1}" psql -X -c "SELECT * FROM worlber_ha.agent_log($arg, 50)" ;;
     logs) dc logs -f "$2" ;;
     pglog) dc exec "$2" tail -f /var/lib/worlber_ha/postgresql.log ;;
     witness) dc --profile witness up -d --no-build witness ;;
     test) cmd_test ;;
     down) dc --profile witness down -v --remove-orphans ;;
-    *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

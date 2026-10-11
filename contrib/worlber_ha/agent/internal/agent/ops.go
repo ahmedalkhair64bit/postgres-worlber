@@ -21,11 +21,12 @@ import (
 
 // localOps run on the agent that received the call; everything else is
 // executed by the Raft leader (forwarded if necessary).
-var localOps = map[string]bool{"create_cluster": true, "events": true, "config": true, "local_status": true}
+var localOps = map[string]bool{"create_cluster": true, "events": true, "config": true, "local_status": true, "log": true}
 
 var leaderOps = map[string]bool{
 	"status": true, "add_node": true, "remove_node": true, "set_sync": true,
 	"set_config": true, "switchover": true, "failover": true,
+	"replication": true, "record_event": true,
 }
 
 // execute dispatches a request from the SQL extension.
@@ -82,6 +83,25 @@ func (a *Agent) localOp(ctx context.Context, op string, args json.RawMessage) (o
 		return opResult{Result: cfg}, nil
 	case "local_status":
 		return opResult{Result: a.buildStatus(st, true)}, nil
+	case "log":
+		var req struct {
+			Node  string `json:"node"`
+			Lines int    `json:"lines"`
+			Level string `json:"level"`
+		}
+		_ = json.Unmarshal(args, &req)
+		if req.Node == "" || req.Node == a.cfg.Name {
+			return opResult{Result: a.logs.Tail(clampLines(req.Lines), req.Level)}, nil
+		}
+		n, ok := st.Nodes[req.Node]
+		if !ok {
+			return opResult{}, fmt.Errorf("node %q is not a member", req.Node)
+		}
+		var rep reply
+		if err := a.peerPost(ctx, n.APIAddr, "/peer/log", req, &rep); err != nil {
+			return opResult{}, err
+		}
+		return opResult{Result: rep.Result}, nil
 	}
 	return opResult{}, fmt.Errorf("unknown operation %q", op)
 }
@@ -90,6 +110,17 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	switch op {
 	case "status":
 		return opResult{Result: a.buildStatus(a.fsm.Get(), false)}, nil
+	case "replication":
+		return opResult{Result: a.replicationStatus(a.fsm.Get())}, nil
+	case "record_event":
+		var c fsm.Command
+		if err := json.Unmarshal(args, &c); err != nil {
+			return opResult{}, err
+		}
+		if c.Kind == "" {
+			return opResult{}, fmt.Errorf("kind is required")
+		}
+		return opResult{Result: "ok"}, a.apply(fsm.Command{Op: "event", Kind: c.Kind, Name: c.Name, Detail: c.Detail})
 	case "add_node":
 		return a.addNode(ctx, args)
 	case "remove_node":
@@ -689,4 +720,51 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 		"cluster": st.ClusterName, "primary": st.Primary, "epoch": st.Epoch,
 		"leader": string(leaderID), "paused": st.Paused(), "nodes": rows,
 	}
+}
+
+// replicationRow is one row of worlber_ha.replication: how far each standby
+// is behind, in the terms of SQL Server's log send queue and redo queue.
+type replicationRow struct {
+	Node       string  `json:"node"`
+	ClientAddr string  `json:"client_addr"`
+	State      string  `json:"state"`
+	SyncState  string  `json:"sync_state"`
+	PrimaryLSN string  `json:"primary_lsn"`
+	SentLSN    string  `json:"sent_lsn"`
+	WriteLSN   string  `json:"write_lsn"`
+	FlushLSN   string  `json:"flush_lsn"`
+	ReplayLSN  string  `json:"replay_lsn"`
+	SendQueue  int64   `json:"send_queue_bytes"`
+	RedoQueue  int64   `json:"redo_queue_bytes"`
+	TotalLag   int64   `json:"total_lag_bytes"`
+	WriteLag   float64 `json:"write_lag_s"`
+	FlushLag   float64 `json:"flush_lag_s"`
+	ReplayLag  float64 `json:"replay_lag_s"`
+}
+
+func lsnDiff(a, b uint64) int64 {
+	if a < b {
+		return 0
+	}
+	return int64(a - b)
+}
+
+func (a *Agent) replicationStatus(st fsm.State) []replicationRow {
+	phb, _ := a.beat(st.Primary)
+	rows := []replicationRow{}
+	for _, r := range phb.Health.Replicas {
+		if _, ok := st.Nodes[r.AppName]; !ok {
+			continue
+		}
+		p := phb.Health.LSN
+		rows = append(rows, replicationRow{
+			Node: r.AppName, ClientAddr: r.ClientAddr, State: r.State, SyncState: r.SyncState,
+			PrimaryLSN: pg.FormatLSN(p), SentLSN: pg.FormatLSN(r.SentLSN), WriteLSN: pg.FormatLSN(r.WriteLSN),
+			FlushLSN: pg.FormatLSN(r.FlushLSN), ReplayLSN: pg.FormatLSN(r.ReplayLSN),
+			SendQueue: lsnDiff(p, r.FlushLSN), RedoQueue: lsnDiff(r.FlushLSN, r.ReplayLSN), TotalLag: lsnDiff(p, r.ReplayLSN),
+			WriteLag: r.WriteLag, FlushLag: r.FlushLag, ReplayLag: r.ReplayLag,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Node < rows[j].Node })
+	return rows
 }

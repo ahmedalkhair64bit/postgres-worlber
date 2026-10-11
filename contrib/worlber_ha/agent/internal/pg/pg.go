@@ -33,11 +33,17 @@ type Local struct {
 
 // ReplicaStat is one row of pg_stat_replication.
 type ReplicaStat struct {
-	AppName   string `json:"application_name"`
-	State     string `json:"state"`
-	SyncState string `json:"sync_state"`
-	ReplayLSN uint64 `json:"replay_lsn"`
-	FlushLSN  uint64 `json:"flush_lsn"`
+	AppName    string  `json:"application_name"`
+	ClientAddr string  `json:"client_addr"`
+	State      string  `json:"state"`
+	SyncState  string  `json:"sync_state"`
+	SentLSN    uint64  `json:"sent_lsn"`
+	WriteLSN   uint64  `json:"write_lsn"`
+	FlushLSN   uint64  `json:"flush_lsn"`
+	ReplayLSN  uint64  `json:"replay_lsn"`
+	WriteLag   float64 `json:"write_lag"`  // seconds
+	FlushLag   float64 `json:"flush_lag"`  // seconds
+	ReplayLag  float64 `json:"replay_lag"` // seconds
 }
 
 // Health is a point-in-time observation of the local instance.
@@ -184,16 +190,24 @@ func (l *Local) Probe(ctx context.Context) Health {
 		h.WalReceiver = *wr
 	}
 	if !h.InRecovery {
-		rows, err := c.Query(ctx, `SELECT application_name, coalesce(state,''), coalesce(sync_state,''),
-		                                  coalesce(replay_lsn::text,'0/0'), coalesce(flush_lsn::text,'0/0')
+		rows, err := c.Query(ctx, `SELECT application_name, coalesce(client_addr::text, 'local'),
+		                                  coalesce(state, ''), coalesce(sync_state, ''),
+		                                  coalesce(sent_lsn::text, '0/0'), coalesce(write_lsn::text, '0/0'),
+		                                  coalesce(flush_lsn::text, '0/0'), coalesce(replay_lsn::text, '0/0'),
+		                                  coalesce(extract(epoch FROM write_lag), 0)::float8,
+		                                  coalesce(extract(epoch FROM flush_lag), 0)::float8,
+		                                  coalesce(extract(epoch FROM replay_lag), 0)::float8
 		                           FROM pg_stat_replication`)
 		if err == nil {
 			for rows.Next() {
 				var r ReplicaStat
-				var rl, fl string
-				if rows.Scan(&r.AppName, &r.State, &r.SyncState, &rl, &fl) == nil {
-					r.ReplayLSN, _ = ParseLSN(rl)
+				var sl, wl, fl, rl string
+				if rows.Scan(&r.AppName, &r.ClientAddr, &r.State, &r.SyncState, &sl, &wl, &fl, &rl,
+					&r.WriteLag, &r.FlushLag, &r.ReplayLag) == nil {
+					r.SentLSN, _ = ParseLSN(sl)
+					r.WriteLSN, _ = ParseLSN(wl)
 					r.FlushLSN, _ = ParseLSN(fl)
+					r.ReplayLSN, _ = ParseLSN(rl)
 					h.Replicas = append(h.Replicas, r)
 				}
 			}

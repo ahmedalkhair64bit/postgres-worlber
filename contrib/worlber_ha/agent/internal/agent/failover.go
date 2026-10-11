@@ -127,6 +127,14 @@ func (a *Agent) checkPrimary() {
 			a.primaryBad = a.leaderSince
 		}
 		a.log.Warn("primary unhealthy", "primary", st.Primary, "fresh", fresh, "running", hb.Health.Running)
+		if !hb.At.IsZero() {
+			why := "agent unreachable"
+			if fresh {
+				why = "PostgreSQL not running"
+			}
+			a.report(context.Background(), "primary_unhealthy", fmt.Sprintf("%s: %s; failover in %s unless it recovers",
+				st.Primary, why, st.Duration("failover_timeout")))
+		}
 	}
 	badFor := time.Since(a.primaryBad)
 	a.mu.Unlock()
@@ -145,9 +153,10 @@ func (a *Agent) checkPrimary() {
 	name, why := PickCandidate(a.candidates(st), hb.Health.LSN, maxLag, strict)
 	if name == "" {
 		a.mu.Lock()
-		if time.Since(a.lastNoCand) > 10*time.Second {
+		if time.Since(a.lastNoCand) > 60*time.Second {
 			a.lastNoCand = time.Now()
 			a.log.Error("primary down but no failover candidate", "primary", st.Primary, "reason", why)
+			a.report(context.Background(), "failover_blocked", why)
 		}
 		a.mu.Unlock()
 		return

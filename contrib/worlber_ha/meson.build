@@ -18,6 +18,7 @@ contrib_targets += worlber_ha
 
 install_data(
   'worlber_ha--1.0.sql',
+  'worlber_ha--1.0--1.1.sql',
   'worlber_ha.control',
   kwargs: contrib_data_args,
 )

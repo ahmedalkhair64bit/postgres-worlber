@@ -129,13 +129,18 @@ All objects live in schema `worlber_ha`. Management needs superuser or the role
 | `set_sync(node, true/false)` | `AVAILABILITY_MODE = SYNCHRONOUS_COMMIT / ASYNCHRONOUS_COMMIT` |
 | `set_config(option, value)` | cluster options, see below |
 | `pause()` / `resume()` | maintenance mode: no automatic failover, agents leave PostgreSQL alone |
-| `connection_string(dbname, read_only => false)` | multi-host libpq URI with `target_session_attrs` (the "listener") |
+| `connection_string(dbname, read_only => false)` | multi-host libpq URI with `target_session_attrs` |
+| `health_check()` | one row per problem (`CRITICAL`/`WARNING`), or a single `OK` row |
+| `agent_log(node => NULL, lines => 100, min_level => 'info')` | the agent log of any node, read through SQL |
 
 | View | Content |
 |---|---|
 | `cluster_status` | node, host, port, role, state, sync, sync_state, timeline, lsn, replay_lsn, lag_bytes, raft_role, last_seen, agent_status |
 | `cluster_config` | current options |
-| `events` | history: cluster created, nodes added, switchovers, failovers, option changes |
+| `events` | history: cluster created, nodes added, seeding, rewind/rejoin, promotion, demotion, fencing, VIP moves, switchovers, failovers, option changes |
+| `replication` | per standby: sent/write/flush/replay LSN, **log send queue**, **redo queue**, write/flush/replay lag (like `sys.dm_hadr_database_replica_states`) |
+| `redo` | on the node you are connected to: WAL received vs replayed, redo queue, replay delay, pause state |
+| `blocking` | on the node you are connected to: commits waiting for a synchronous replica, lock waits, and redo blocked by queries on a standby |
 
 Options:
 
@@ -149,6 +154,77 @@ Options:
 GUCs: `worlber_ha.agent_socket` (default
 `<first unix_socket_directories>/.s.WORLBER_HA.<port>`, the same default the
 agent uses) and `worlber_ha.agent_timeout` (default 30s).
+
+## Connecting applications: listener, VIP, load balancer
+
+Only the primary accepts writes. Replicas are hot standbys and accept
+read-only queries (single writer, no multi-master). There are four ways for
+applications to always find the primary:
+
+| Option | How | Best for |
+|---|---|---|
+| **Listener** (built in, like an AG listener) | start the agents with `--listen-rw 0.0.0.0:5000 --listen-ro 0.0.0.0:5001`. Port 5000 on *any* node forwards to the current primary; port 5001 spreads read-only sessions over streaming standbys (and falls back to the primary). On a role change, the listener closes connections to the old primary so that clients reconnect at once. | every setup; combine with a VIP or DNS name listing all nodes |
+| **VIP** (built in) | `--vip 10.0.0.100/24 --vip-interface eth0`. The primary's agent adds the IP and sends gratuitous ARP; the agent of a demoted or fenced primary removes it. Requires `CAP_NET_ADMIN`/`CAP_NET_RAW` (the systemd unit grants them). | on-prem / VMware / bare metal, same L2 network |
+| **Load balancer** | health checks against the agent: `GET http://node:7400/health/primary` returns 200 only on the primary; `/health/replica` returns 200 only on a streaming standby. | GCP internal TCP LB, AWS NLB, HAProxy, F5 |
+| **Role-change hook** | `--on-role-change /path/script`, called as `script <primary\|replica\|stopped> <cluster> <node>`. See `packaging/role-change-gcp-alias-ip.sh` (moves a GCP alias IP). | cloud alias IPs, DNS updates, custom actions |
+| **libpq multi-host** | `SELECT worlber_ha.connection_string()` | apps that can use libpq/JDBC multi-host URIs |
+
+The lab (`testing/lab.sh`) has the listener on ports 5000/5001 and the VIP
+`172.28.0.100` enabled.
+
+## How data is replicated
+
+worlber_ha uses PostgreSQL's built-in physical streaming replication. It
+does not copy data itself.
+
+1. **Seeding:** `add_node` makes the new node's agent run `pg_basebackup` from
+   the primary through its own replication slot. This is like AG automatic
+   seeding.
+2. **Streaming:** every change on the primary is written to the WAL. The
+   primary's WAL sender streams it to each standby's WAL receiver, which
+   writes and flushes it to the standby's disk.
+3. **Redo:** the standby's startup process replays (redoes) the WAL. Data
+   becomes visible to read-only queries on the replica once it is replayed.
+4. **Synchronous commit:** for nodes added with `sync => true`, a COMMIT on
+   the primary waits until a synchronous standby has flushed the WAL. That is
+   PostgreSQL's `synchronous_commit = on`, managed through
+   `synchronous_standby_names = 'ANY 1 (...)'`. A session can ask for more or
+   less:
+   * `SET synchronous_commit = remote_apply`: wait until the standby has
+     *replayed* the change (read-your-writes on the replica);
+   * `remote_write`: the standby has received the change;
+   * `local`: do not wait.
+
+   If all synchronous standbys are down:
+   * `synchronous_mode = 'available'` (default): the agent removes them from
+     `synchronous_standby_names` and commits continue;
+   * `'strict'`: commits wait (visible in `worlber_ha.blocking`) until a
+     synchronous standby is back. There is never data loss on failover.
+5. **Slots:** each standby has a physical replication slot
+   (`worlber_ha_<node>`) on the primary, so WAL is kept until the standby has
+   received it.
+6. **Failover/rejoin:** a standby is promoted with `pg_promote()`. The others
+   are re-pointed to it with ALTER SYSTEM `primary_conninfo` and a reload. The
+   old primary is synchronized with `pg_rewind` and restarted as a standby.
+
+## Monitoring cheat sheet
+
+```sql
+SELECT * FROM worlber_ha.health_check();          -- is everything OK? what is wrong?
+SELECT * FROM worlber_ha.cluster_status;          -- roles, states, lag, Raft roles, agent status
+SELECT * FROM worlber_ha.replication;             -- log send queue / redo queue / lag per standby
+SELECT * FROM worlber_ha.redo;                    -- on a replica: redo queue, replay delay
+SELECT * FROM worlber_ha.blocking;                -- sync-commit waits, lock waits, blocked redo
+SELECT * FROM worlber_ha.events LIMIT 20;         -- failover, rejoin, seeding, fencing history
+SELECT * FROM worlber_ha.events WHERE node = 'pg2';                 -- the join/rejoin story of one node
+SELECT * FROM worlber_ha.agent_log('pg2', 50);                      -- the agent log of pg2
+SELECT * FROM worlber_ha.agent_log(min_level => 'warn', lines => 50); -- warnings/errors here
+```
+
+Typical sequence of `events` during an automatic failover and rejoin:
+`primary_unhealthy` → `automatic_failover` → `promoted` → `role_primary` /
+`vip_acquired` → `repointed` (other standbys) → later, on the old primary,
+`demoted` or `rejoin_started` → `rewind_completed` → `standby_started`.
 
 ## Testing
 
@@ -175,7 +251,4 @@ through `pg_rewind`.
 * Agent-to-agent traffic (API and Raft) is plain TCP, authenticated by the
   shared token. Put it on a private network until TLS (mTLS) is added. The
   replication password is stored in the Raft state (`--data-dir`, mode 0700).
-* No virtual IP yet. Applications use `connection_string()` (libpq multi-host
-  with `target_session_attrs=read-write`), or a proxy such as HAProxy that
-  checks `pg_is_in_recovery()`.
 * Read-only routing lists and backup preferences are not implemented yet.

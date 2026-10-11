@@ -22,6 +22,12 @@ SELECT has_function_privilege('public', 'worlber_ha.switchover(text)', 'EXECUTE'
        has_function_privilege('pg_monitor', 'worlber_ha.failover(text, boolean)', 'EXECUTE') AS monitor_failover,
        has_table_privilege('pg_monitor', 'worlber_ha.cluster_status', 'SELECT') AS monitor_view;
 
+-- node-local monitoring views work without the agent
+SELECT is_standby, receiver_status, redo_queue_bytes FROM worlber_ha.redo;
+SELECT count(*) AS blocked_sessions FROM worlber_ha.blocking;
+SELECT has_table_privilege('pg_monitor', 'worlber_ha.blocking', 'SELECT') AS monitor_blocking,
+       has_function_privilege('pg_monitor', 'worlber_ha.health_check()', 'EXECUTE') AS monitor_health;
+
 -- no agent listening
 SET worlber_ha.agent_socket = '/nonexistent/worlber_ha.sock';
 SELECT worlber_ha.agent_socket_path();
@@ -35,6 +41,15 @@ SELECT worlber_ha.agent_request(NULL);
 SET worlber_ha.agent_timeout = 0;
 RESET worlber_ha.agent_timeout;
 RESET worlber_ha.agent_socket;
+
+DROP EXTENSION worlber_ha;
+
+-- upgrade path 1.0 -> 1.1
+CREATE EXTENSION worlber_ha VERSION '1.0';
+SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
+ALTER EXTENSION worlber_ha UPDATE TO '1.1';
+SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
+SELECT count(*) AS blocked_sessions FROM worlber_ha.blocking;
 
 DROP EXTENSION worlber_ha;
 DROP ROLE worlber_ha_admin;

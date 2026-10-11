@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -37,6 +38,11 @@ type Config struct {
 	PGAdvertise  string // host other nodes use to reach this PostgreSQL
 	ReinitPGData bool   // allow moving aside a foreign PGDATA
 	ReplUser     string
+	ListenRW     string // listener for read-write clients (e.g. :5000)
+	ListenRO     string // listener for read-only clients (e.g. :5001)
+	VIP          string // floating IP held by the primary (e.g. 10.0.0.100/24)
+	VIPInterface string // interface for the VIP (e.g. eth0)
+	OnRoleChange string // script called as: <script> <role> <cluster> <node>
 	Tick         time.Duration
 	PG           *pg.Local
 	LogLevel     string
@@ -79,6 +85,9 @@ type Agent struct {
 	opMu sync.Mutex // serializes leader operations (switchover, failover...)
 
 	stop context.CancelFunc // ends Run (used when removed from the cluster)
+
+	logs   *logRing
+	router *router
 }
 
 // leftMarker is created when this node was removed from its cluster; on the
@@ -100,9 +109,12 @@ func New(cfg Config) (*Agent, error) {
 	if lvl == hclog.NoLevel {
 		lvl = hclog.Info
 	}
+	ring := newLogRing(2000)
 	a := &Agent{
-		cfg:   cfg,
-		log:   hclog.New(&hclog.LoggerOptions{Name: "worlber-ha[" + cfg.Name + "]", Level: lvl, IndependentLevels: true}),
+		cfg:  cfg,
+		logs: ring,
+		log: hclog.New(&hclog.LoggerOptions{Name: "worlber-ha[" + cfg.Name + "]", Level: lvl,
+			IndependentLevels: true, Output: io.MultiWriter(os.Stderr, ring)}),
 		fsm:   fsm.New(),
 		pg:    cfg.PG,
 		http:  &http.Client{Timeout: 15 * time.Second},
@@ -191,10 +203,22 @@ func (a *Agent) Run(ctx context.Context) error {
 	localSrv := &http.Server{Handler: a.localHandler()}
 	go peerSrv.Serve(peerLn)
 	go localSrv.Serve(localLn)
+	a.router = newRouter(a)
+	for _, l := range []struct {
+		addr string
+		ro   bool
+	}{{a.cfg.ListenRW, false}, {a.cfg.ListenRO, true}} {
+		if l.addr != "" {
+			if err := a.router.listen(ctx, l.addr, l.ro); err != nil {
+				return err
+			}
+		}
+	}
 	a.log.Info("agent started", "raft", a.cfg.RaftAddr, "api", a.cfg.APIAddr, "socket", a.cfg.Socket, "witness", a.cfg.Witness)
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
+	go func() { defer wg.Done(); a.router.run(ctx) }()
 	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
 	go func() { defer wg.Done(); a.reconcileLoop(ctx) }()
 	go func() { defer wg.Done(); a.leaderLoop(ctx) }()
@@ -297,6 +321,21 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		}
 		_ = a.peerPost(ctx, addr, "/peer/heartbeat", hb, nil)
 	}
+}
+
+// report records something this agent did in the cluster event history.
+// It is best effort and never blocks the caller.
+func (a *Agent) report(ctx context.Context, kind, detail string) {
+	c := fsm.Command{Op: "event", Kind: kind, Name: a.cfg.Name, Detail: detail}
+	go func() {
+		if a.isLeader() {
+			_ = a.apply(c)
+			return
+		}
+		if addr, err := a.leaderAPI(); err == nil {
+			_ = a.peerPost(context.Background(), addr, "/peer/op/record_event", c, nil)
+		}
+	}()
 }
 
 func (a *Agent) recordBeat(hb heartbeat) {

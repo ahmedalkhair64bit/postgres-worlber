@@ -50,6 +50,8 @@ setpriv --reuid=postgres --regid=postgres --init-groups -- worlber-ha-agent \
     --pg-log "$STATE/postgresql.log" \
     --api-addr "$NODE_NAME:7400" --api-bind 0.0.0.0:7400 \
     --raft-addr "$NODE_NAME:7401" --raft-bind 0.0.0.0:7401 \
+    --listen-rw 0.0.0.0:5000 --listen-ro 0.0.0.0:5001 \
+    ${VIP:+--vip "$VIP" --vip-interface "${VIP_INTERFACE:-eth0}"} \
     --log-level "${LOG_LEVEL:-info}" \
     "$@" &
 agent=$!

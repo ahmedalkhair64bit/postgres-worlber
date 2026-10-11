@@ -17,7 +17,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-const maxEvents = 200
+const maxEvents = 500
 
 // Node roles as stored in the FSM.
 const (
@@ -88,6 +88,10 @@ type Command struct {
 
 	// set_sync
 	Sync bool `json:"sync,omitempty"`
+
+	// event
+	Kind   string `json:"kind,omitempty"`
+	Detail string `json:"detail,omitempty"`
 
 	// set_config
 	Key   string `json:"key,omitempty"`
@@ -285,6 +289,14 @@ func (s *State) apply(c Command) error {
 		}
 		s.Config[c.Key] = c.Value
 		s.event(c.Time, "config_changed", "", c.Key+"="+c.Value)
+
+	case "event":
+		// Something an agent did locally (seeding, rewind, promotion,
+		// fencing...), recorded for the history in worlber_ha.events.
+		if c.Kind == "" {
+			return fmt.Errorf("event requires a kind")
+		}
+		s.event(c.Time, c.Kind, c.Name, c.Detail)
 
 	default:
 		return fmt.Errorf("unknown op %q", c.Op)

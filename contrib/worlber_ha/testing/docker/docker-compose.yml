@@ -3,7 +3,13 @@
 #   cd contrib/worlber_ha/testing && ./lab.sh up && ./lab.sh setup
 #
 # Hosts:  pg1 (initial primary), pg2, pg3 on network worlber-lab-net.
-# Ports on the docker host: 5441-5443 -> PostgreSQL on pg1-pg3.
+# Ports on the docker host:
+#   5441-5443  PostgreSQL on pg1-pg3 directly
+#   5000       listener, read-write  -> always the primary   (via pg1's agent)
+#   5001       listener, read-only   -> a streaming replica  (via pg1's agent)
+#   5010/5011  the same listeners via pg2, 5020/5021 via pg3
+# VIP 172.28.0.100 always points at the primary (reachable from containers
+# and, on Linux, from the docker host).
 name: worlber-lab
 
 x-node: &node
@@ -14,6 +20,9 @@ x-node: &node
   environment: &env
     WORLBER_HA_TOKEN: lab-secret-change-me
     POSTGRES_PASSWORD: postgres
+    VIP: 172.28.0.100/24
+    VIP_INTERFACE: eth0
+  cap_add: [NET_ADMIN, NET_RAW]
   restart: unless-stopped
   stop_grace_period: 30s
 
@@ -25,7 +34,7 @@ services:
       <<: *env
       NODE_NAME: pg1
       INIT_PRIMARY: "1"
-    ports: ["5441:5432"]
+    ports: ["5441:5432", "5000:5000", "5001:5001"]
     volumes: [pg1:/var/lib/postgresql, pg1state:/var/lib/worlber_ha]
     networks: {lab: {ipv4_address: 172.28.0.11}}
 
@@ -33,7 +42,7 @@ services:
     <<: *node
     hostname: pg2
     environment: {<<: *env, NODE_NAME: pg2}
-    ports: ["5442:5432"]
+    ports: ["5442:5432", "5010:5000", "5011:5001"]
     volumes: [pg2:/var/lib/postgresql, pg2state:/var/lib/worlber_ha]
     networks: {lab: {ipv4_address: 172.28.0.12}}
 
@@ -41,7 +50,7 @@ services:
     <<: *node
     hostname: pg3
     environment: {<<: *env, NODE_NAME: pg3}
-    ports: ["5443:5432"]
+    ports: ["5443:5432", "5020:5000", "5021:5001"]
     volumes: [pg3:/var/lib/postgresql, pg3state:/var/lib/worlber_ha]
     networks: {lab: {ipv4_address: 172.28.0.13}}
 
@@ -50,7 +59,7 @@ services:
     <<: *node
     profiles: [witness]
     hostname: witness
-    environment: {<<: *env, NODE_NAME: witness}
+    environment: {<<: *env, NODE_NAME: witness, VIP: ""}
     command: ["--witness"]
     volumes: [witnessstate:/var/lib/worlber_ha]
     networks: {lab: {ipv4_address: 172.28.0.20}}

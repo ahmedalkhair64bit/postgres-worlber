@@ -13,6 +13,13 @@
 #   WORLBER_HA_PGBIN=/usr/pgsql/bin
 #   WORLBER_HA_PG_SOCKET_DIR=/var/run/postgresql
 #   PGDATA=/var/lib/pgsql/data
+#   # optional: listener (like an AG listener) and floating IP
+#   WORLBER_HA_LISTEN_RW=0.0.0.0:5000
+#   WORLBER_HA_LISTEN_RO=0.0.0.0:5001
+#   WORLBER_HA_VIP=10.0.0.100/24
+#   WORLBER_HA_VIP_INTERFACE=eth0
+#   # optional: script run on role changes (cloud IP, DNS, load balancer)
+#   WORLBER_HA_ON_ROLE_CHANGE=/etc/worlber_ha/role-change.sh
 
 [Unit]
 Description=worlber_ha PostgreSQL HA agent
@@ -25,6 +32,8 @@ User=postgres
 Group=postgres
 EnvironmentFile=/etc/worlber_ha/agent.env
 ExecStart=/usr/pgsql/bin/worlber-ha-agent --pg-port 5432
+# needed only for WORLBER_HA_VIP (add/remove the IP and send gratuitous ARP)
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 Restart=always
 RestartSec=2
 # The agent starts and stops PostgreSQL itself; do not let systemd kill the
