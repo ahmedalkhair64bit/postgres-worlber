@@ -37,13 +37,14 @@ type routeTable struct {
 type router struct {
 	a *Agent
 
-	mu    sync.Mutex
-	table routeTable
-	conns map[net.Conn]uint64 // read-write client connections -> epoch
-	rr    atomic.Uint64
-	vipOn bool
-	role  string
-	noArp bool
+	mu     sync.Mutex
+	table  routeTable
+	conns  map[net.Conn]uint64 // read-write client connections -> epoch
+	rr     atomic.Uint64
+	vipOn  bool
+	role   string
+	noArp  bool
+	vipErr time.Time // last VIP error logged (rate limit)
 }
 
 func newRouter(a *Agent) *router {
@@ -301,7 +302,10 @@ func (r *router) vip(on bool) {
 	if on {
 		out, err := exec.Command("ip", "addr", "add", addr, "dev", iface).CombinedOutput()
 		if err != nil && !strings.Contains(string(out), "File exists") {
-			r.a.log.Error("cannot add VIP (the agent needs CAP_NET_ADMIN)", "vip", addr, "dev", iface, "error", strings.TrimSpace(string(out)))
+			if time.Since(r.vipErr) > time.Minute {
+				r.vipErr = time.Now()
+				r.a.log.Error("cannot add VIP (the agent needs CAP_NET_ADMIN)", "vip", addr, "dev", iface, "error", strings.TrimSpace(string(out)))
+			}
 			return
 		}
 		r.vipOn = true

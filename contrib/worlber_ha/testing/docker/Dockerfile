@@ -36,10 +36,8 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libreadline8t64 zlib1g libssl3t64 liblz4-1 libzstd1 tzdata ca-certificates \
-        procps iproute2 iputils-arping libcap2-bin less \
+        procps iproute2 iputils-arping less \
     && rm -rf /var/lib/apt/lists/* \
-    && setcap cap_net_admin+ep "$(readlink -f "$(command -v ip)")" \
-    && setcap cap_net_raw+ep "$(readlink -f "$(command -v arping)")" \
     && (getent passwd postgres || useradd --system --home-dir /var/lib/postgresql --create-home --shell /bin/bash postgres)
 COPY --from=build /usr/local/pgsql /usr/local/pgsql
 COPY --from=agent /worlber-ha-agent /usr/local/pgsql/bin/worlber-ha-agent

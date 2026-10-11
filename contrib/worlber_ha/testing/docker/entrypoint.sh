@@ -38,7 +38,13 @@ fi
 # The agent never stops PostgreSQL when it exits (an agent restart must not
 # take the database down).  In a container, the server dies with the
 # container, so stop it cleanly after the agent ends.
-setpriv --reuid=postgres --regid=postgres --init-groups -- worlber-ha-agent \
+# With a VIP the agent needs CAP_NET_ADMIN/CAP_NET_RAW (ip addr, arping):
+# pass them as ambient capabilities to the unprivileged agent.
+caps=()
+if [ -n "${VIP:-}" ]; then
+    caps=(--inh-caps=+net_admin,+net_raw --ambient-caps=+net_admin,+net_raw)
+fi
+setpriv --reuid=postgres --regid=postgres --init-groups "${caps[@]}" -- worlber-ha-agent \
     --name "$NODE_NAME" \
     --token "$WORLBER_HA_TOKEN" \
     --data-dir "$STATE" \

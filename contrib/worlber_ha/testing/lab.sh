@@ -77,6 +77,7 @@ wait_until() {
         sleep 1
     done
     echo "  TIMEOUT: $desc"
+    cmd_status 2>/dev/null | sed 's/^/    /' || true
     return 1
 }
 

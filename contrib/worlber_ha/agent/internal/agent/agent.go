@@ -88,6 +88,10 @@ type Agent struct {
 
 	logs   *logRing
 	router *router
+
+	evMu      sync.Mutex    // protects pending (separate from mu: report() may be called with mu held)
+	pending   []fsm.Command // events waiting for delivery to the leader
+	eventKick chan struct{}
 }
 
 // leftMarker is created when this node was removed from its cluster; on the
@@ -119,6 +123,8 @@ func New(cfg Config) (*Agent, error) {
 		pg:    cfg.PG,
 		http:  &http.Client{Timeout: 15 * time.Second},
 		beats: map[string]heartbeat{},
+
+		eventKick: make(chan struct{}, 1),
 	}
 	return a, nil
 }
@@ -217,7 +223,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent started", "raft", a.cfg.RaftAddr, "api", a.cfg.APIAddr, "socket", a.cfg.Socket, "witness", a.cfg.Witness)
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
+	go func() { defer wg.Done(); a.eventLoop(ctx) }()
 	go func() { defer wg.Done(); a.router.run(ctx) }()
 	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
 	go func() { defer wg.Done(); a.reconcileLoop(ctx) }()
@@ -324,18 +331,57 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 }
 
 // report records something this agent did in the cluster event history.
-// It is best effort and never blocks the caller.
+// It never blocks: events are queued and delivered to the Raft leader by
+// eventLoop, so an event raised while partitioned (e.g. "fenced") is
+// recorded once the node can reach the leader again.
 func (a *Agent) report(ctx context.Context, kind, detail string) {
 	c := fsm.Command{Op: "event", Kind: kind, Name: a.cfg.Name, Detail: detail}
-	go func() {
-		if a.isLeader() {
-			_ = a.apply(c)
+	a.evMu.Lock()
+	if len(a.pending) < 200 {
+		a.pending = append(a.pending, c)
+	}
+	a.evMu.Unlock()
+	select {
+	case a.eventKick <- struct{}{}:
+	default:
+	}
+}
+
+// eventLoop delivers queued events in order.
+func (a *Agent) eventLoop(ctx context.Context) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-t.C:
+		case <-a.eventKick:
 		}
-		if addr, err := a.leaderAPI(); err == nil {
-			_ = a.peerPost(context.Background(), addr, "/peer/op/record_event", c, nil)
+		for {
+			a.evMu.Lock()
+			if len(a.pending) == 0 {
+				a.evMu.Unlock()
+				break
+			}
+			c := a.pending[0]
+			a.evMu.Unlock()
+			var err error
+			if a.isLeader() {
+				err = a.apply(c)
+			} else if addr, lerr := a.leaderAPI(); lerr != nil {
+				err = lerr
+			} else {
+				err = a.peerPostTimeout(ctx, addr, "/peer/op/record_event", c, nil, 5*time.Second)
+			}
+			if err != nil {
+				break // retry later
+			}
+			a.evMu.Lock()
+			a.pending = a.pending[1:]
+			a.evMu.Unlock()
 		}
-	}()
+	}
 }
 
 func (a *Agent) recordBeat(hb heartbeat) {
