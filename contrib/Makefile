@@ -53,7 +53,8 @@ SUBDIRS = \
 		tsm_system_rows \
 		tsm_system_time \
 		unaccent	\
-		vacuumlo
+		vacuumlo	\
+		worlber_ha
 
 ifeq ($(with_ssl),openssl)
 SUBDIRS += pgcrypto sslinfo

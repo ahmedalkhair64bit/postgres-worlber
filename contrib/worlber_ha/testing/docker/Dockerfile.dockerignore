@@ -1,0 +1,7 @@
+.git
+**/*.o
+**/*.so
+**/tmp_check
+**/results
+**/log
+contrib/worlber_ha/agent/worlber-ha-agent

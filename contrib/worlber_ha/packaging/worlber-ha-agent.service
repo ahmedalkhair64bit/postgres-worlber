@@ -1,0 +1,36 @@
+# systemd unit for the worlber_ha node agent.
+# Install as /etc/systemd/system/worlber-ha-agent.service and adjust
+# /etc/worlber_ha/agent.env (see below), then:
+#   systemctl enable --now worlber-ha-agent
+#
+# Example /etc/worlber_ha/agent.env:
+#   WORLBER_HA_NAME=pg1
+#   WORLBER_HA_TOKEN_FILE=/etc/worlber_ha/token
+#   WORLBER_HA_DATA_DIR=/var/lib/worlber_ha
+#   WORLBER_HA_API_ADDR=pg1.example.com:7400
+#   WORLBER_HA_RAFT_ADDR=pg1.example.com:7401
+#   WORLBER_HA_PG_HOST=pg1.example.com
+#   WORLBER_HA_PGBIN=/usr/pgsql/bin
+#   WORLBER_HA_PG_SOCKET_DIR=/var/run/postgresql
+#   PGDATA=/var/lib/pgsql/data
+
+[Unit]
+Description=worlber_ha PostgreSQL HA agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/worlber_ha/agent.env
+ExecStart=/usr/pgsql/bin/worlber-ha-agent --pg-port 5432
+Restart=always
+RestartSec=2
+# The agent starts and stops PostgreSQL itself; do not let systemd kill the
+# postmaster when the agent restarts.
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
