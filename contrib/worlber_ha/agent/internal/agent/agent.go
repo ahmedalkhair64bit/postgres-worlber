@@ -283,7 +283,9 @@ func (a *Agent) hasQuorum(within time.Duration) bool {
 
 // apply commits a command through Raft (leader only).
 func (a *Agent) apply(c fsm.Command) error {
-	c.Time = time.Now().Unix()
+	if c.Time == 0 {
+		c.Time = time.Now().Unix()
+	}
 	b, _ := json.Marshal(c)
 	f := a.raft.Apply(b, 10*time.Second)
 	if err := f.Error(); err != nil {
@@ -335,7 +337,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 // eventLoop, so an event raised while partitioned (e.g. "fenced") is
 // recorded once the node can reach the leader again.
 func (a *Agent) report(ctx context.Context, kind, detail string) {
-	c := fsm.Command{Op: "event", Kind: kind, Name: a.cfg.Name, Detail: detail}
+	// keep the time the event happened, not the time it was delivered
+	c := fsm.Command{Op: "event", Kind: kind, Name: a.cfg.Name, Detail: detail, Time: time.Now().Unix()}
 	a.evMu.Lock()
 	if len(a.pending) < 200 {
 		a.pending = append(a.pending, c)

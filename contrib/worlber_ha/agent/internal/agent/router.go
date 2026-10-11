@@ -70,8 +70,12 @@ func (r *router) run(ctx context.Context) {
 	t := time.NewTicker(r.a.cfg.Tick)
 	defer t.Stop()
 	for {
-		r.refresh(ctx)
+		// VIP and hooks first: they only need local state and must not wait
+		// behind a slow status call while the old leader is unreachable.
 		r.manageRole(ctx)
+		rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		r.refresh(rctx)
+		cancel()
 		select {
 		case <-ctx.Done():
 			if r.vipOn {

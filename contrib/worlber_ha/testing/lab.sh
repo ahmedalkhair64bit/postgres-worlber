@@ -261,13 +261,14 @@ cmd_test() {
     cmd_isolate "$old"
     check "isolated primary fenced itself (PostgreSQL stopped)" wait_until "$t" "$old fenced" pg_down_on "$old"
     check "majority elected a new primary" wait_until "$t" "new primary" has_new_primary "$old"
-    check "fencing recorded in events" wait_until 30 "fenced event" test "$(anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'fenced' AND node = '$old'")" = t
     new=$(primary)
     echo "  new primary: $new"
     sql "$new" "INSERT INTO lab_test SELECT g, '$new' FROM generate_series(3001, 4000) g"
     cmd_heal "$old"
     check "healed node $old rejoined" wait_until 120 "$old streaming" is_role "$old" replica streaming
     check "healed node $old caught up" wait_until 30 "$old has 4000 rows" count_is "$old" 4000
+    # recorded by the isolated node itself, delivered once it could reach the leader again
+    check "fencing recorded in events" wait_until 30 "fenced event" test "$(anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'fenced' AND node = '$old'")" = t
 
     echo; echo "== 6. remove a replica and add it back"
     p=$(primary)

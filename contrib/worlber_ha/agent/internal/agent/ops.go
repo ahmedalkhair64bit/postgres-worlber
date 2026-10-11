@@ -120,7 +120,7 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 		if c.Kind == "" {
 			return opResult{}, fmt.Errorf("kind is required")
 		}
-		return opResult{Result: "ok"}, a.apply(fsm.Command{Op: "event", Kind: c.Kind, Name: c.Name, Detail: c.Detail})
+		return opResult{Result: "ok"}, a.apply(fsm.Command{Op: "event", Kind: c.Kind, Name: c.Name, Detail: c.Detail, Time: c.Time})
 	case "add_node":
 		return a.addNode(ctx, args)
 	case "remove_node":
