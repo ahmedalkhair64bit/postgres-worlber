@@ -36,7 +36,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libreadline8t64 zlib1g libssl3t64 liblz4-1 libzstd1 tzdata ca-certificates \
-        procps iproute2 less \
+        procps iproute2 iputils-arping less \
     && rm -rf /var/lib/apt/lists/* \
     && (getent passwd postgres || useradd --system --home-dir /var/lib/postgresql --create-home --shell /bin/bash postgres)
 COPY --from=build /usr/local/pgsql /usr/local/pgsql
@@ -47,5 +47,5 @@ ENV PATH=/usr/local/pgsql/bin:$PATH \
     PGDATA=/var/lib/postgresql/data \
     PGHOST=/var/run/postgresql \
     PGUSER=postgres
-EXPOSE 5432 7400 7401
+EXPOSE 5432 5000 5001 7400 7401
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

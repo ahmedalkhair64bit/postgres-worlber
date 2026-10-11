@@ -89,6 +89,7 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 		if lost >= timeout/3 && a.pg.IsRunning() {
 			a.log.Warn("lost Raft quorum, fencing local primary", "lost_for", lost.Round(time.Second))
 			a.setStatus("fenced: lost quorum")
+			a.report(ctx, "fenced", fmt.Sprintf("lost Raft quorum for %s, PostgreSQL stopped", lost.Round(time.Second)))
 			return a.pg.Stop(ctx, "fast")
 		}
 		a.setStatus("waiting for quorum")
@@ -115,6 +116,7 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 		if err := a.pg.Start(ctx); err != nil {
 			return err
 		}
+		a.report(ctx, "primary_started", "PostgreSQL (re)started on the primary")
 	}
 	h := a.pg.Probe(ctx)
 	if !h.Running {
@@ -124,8 +126,10 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 		a.log.Info("promoting local standby", "epoch", st.Epoch)
 		a.setStatus("promoting")
 		if err := a.pg.Promote(ctx); err != nil {
+			a.report(ctx, "promote_failed", err.Error())
 			return fmt.Errorf("promote: %w", err)
 		}
+		a.report(ctx, "promoted", fmt.Sprintf("standby promoted at epoch %d", st.Epoch))
 		return nil
 	}
 	if err := a.ensureSlots(ctx, st); err != nil {
@@ -302,6 +306,7 @@ func (a *Agent) reconcileReplica(ctx context.Context, st fsm.State) error {
 			a.mu.Lock()
 			a.needRewind = true
 			a.mu.Unlock()
+			a.report(ctx, "demoted", "former primary stopped, will rejoin as replica of "+st.Primary)
 			return a.pg.Stop(ctx, "fast")
 		}
 		if h.Running {
@@ -328,6 +333,7 @@ func (a *Agent) reconcileReplica(ctx context.Context, st fsm.State) error {
 	if err := a.pg.Start(ctx); err != nil {
 		return err
 	}
+	a.report(ctx, "standby_started", "following "+st.Primary)
 	a.setStatus("")
 	return nil
 }
@@ -342,6 +348,7 @@ func (a *Agent) followPrimary(ctx context.Context, st fsm.State, h pg.Health) er
 	wantSlot := st.Nodes[a.cfg.Name].SlotName
 	if cur != want || slot != wantSlot {
 		a.log.Info("re-pointing standby", "primary", st.Primary)
+		a.report(ctx, "repointed", "now following "+st.Primary)
 		if err := a.pg.Exec(ctx, "ALTER SYSTEM SET primary_conninfo = "+pg.QuoteLiteral(want)); err != nil {
 			return err
 		}
@@ -373,6 +380,7 @@ func (a *Agent) followPrimary(ctx context.Context, st fsm.State, h pg.Health) er
 	// this standby diverged (e.g. it was ahead of the promoted node).
 	if since > 30*time.Second && a.primaryReachable(ctx, st) {
 		a.log.Warn("standby not streaming for 30s, scheduling rewind")
+		a.report(ctx, "diverged", "standby not streaming for 30s; rewinding from "+st.Primary)
 		a.mu.Lock()
 		a.needRewind = true
 		a.noStreamAt = time.Time{}
@@ -419,6 +427,7 @@ func (a *Agent) moveAsidePGData(ctx context.Context, why string) error {
 	}
 	dst := fmt.Sprintf("%s.worlber_ha_%s.%s", strings.TrimRight(a.pg.PGData, "/"), why, time.Now().Format("20060102T150405"))
 	a.log.Warn("moving PGDATA aside", "to", dst)
+	a.report(ctx, "pgdata_moved_aside", dst)
 	return os.Rename(a.pg.PGData, dst)
 }
 
@@ -435,10 +444,14 @@ func (a *Agent) cloneFromPrimary(ctx context.Context, st fsm.State) error {
 	}
 	a.setStatus("seeding: pg_basebackup from %s", p.Name)
 	a.log.Info("starting base backup", "primary", p.Name)
+	a.report(ctx, "seeding_started", "pg_basebackup from "+p.Name)
+	began := time.Now()
 	if err := a.pg.BaseBackup(ctx, sourceConnInfo(st, p, a.cfg.Name), st.ReplPassword, slot); err != nil {
 		_ = os.RemoveAll(a.pg.PGData)
+		a.report(ctx, "seeding_failed", err.Error())
 		return err
 	}
+	a.report(ctx, "seeding_completed", fmt.Sprintf("pg_basebackup from %s took %s", p.Name, time.Since(began).Round(time.Second)))
 	if err := a.pg.SetAutoConf(a.standbySettings(st)); err != nil {
 		return err
 	}
@@ -481,12 +494,19 @@ func (a *Agent) rewindFromPrimary(ctx context.Context, st fsm.State) (bool, erro
 		return false, nil
 	}
 	a.setStatus("rejoining: pg_rewind from %s", p.Name)
+	a.report(ctx, "rejoin_started", "pg_rewind from "+p.Name)
 	out, err := a.pg.Rewind(ctx, sourceConnInfo(st, p, a.cfg.Name), st.ReplPassword)
 	if err != nil {
 		a.log.Error("pg_rewind failed, re-seeding from primary", "error", err)
+		a.report(ctx, "rewind_failed", "re-seeding: "+err.Error())
 		return false, a.moveAsidePGData(ctx, "diverged")
 	}
 	a.log.Info("pg_rewind done", "output", strings.TrimSpace(out))
+	detail := "data rewound"
+	if strings.Contains(out, "no rewind required") {
+		detail = "no rewind required (clean switchover)"
+	}
+	a.report(ctx, "rewind_completed", detail+" from "+p.Name)
 	a.mu.Lock()
 	a.needRewind = false
 	a.mu.Unlock()

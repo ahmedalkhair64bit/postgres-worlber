@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -37,6 +38,11 @@ type Config struct {
 	PGAdvertise  string // host other nodes use to reach this PostgreSQL
 	ReinitPGData bool   // allow moving aside a foreign PGDATA
 	ReplUser     string
+	ListenRW     string // listener for read-write clients (e.g. :5000)
+	ListenRO     string // listener for read-only clients (e.g. :5001)
+	VIP          string // floating IP held by the primary (e.g. 10.0.0.100/24)
+	VIPInterface string // interface for the VIP (e.g. eth0)
+	OnRoleChange string // script called as: <script> <role> <cluster> <node>
 	Tick         time.Duration
 	PG           *pg.Local
 	LogLevel     string
@@ -79,6 +85,13 @@ type Agent struct {
 	opMu sync.Mutex // serializes leader operations (switchover, failover...)
 
 	stop context.CancelFunc // ends Run (used when removed from the cluster)
+
+	logs   *logRing
+	router *router
+
+	evMu      sync.Mutex    // protects pending (separate from mu: report() may be called with mu held)
+	pending   []fsm.Command // events waiting for delivery to the leader
+	eventKick chan struct{}
 }
 
 // leftMarker is created when this node was removed from its cluster; on the
@@ -100,13 +113,18 @@ func New(cfg Config) (*Agent, error) {
 	if lvl == hclog.NoLevel {
 		lvl = hclog.Info
 	}
+	ring := newLogRing(2000)
 	a := &Agent{
-		cfg:   cfg,
-		log:   hclog.New(&hclog.LoggerOptions{Name: "worlber-ha[" + cfg.Name + "]", Level: lvl, IndependentLevels: true}),
+		cfg:  cfg,
+		logs: ring,
+		log: hclog.New(&hclog.LoggerOptions{Name: "worlber-ha[" + cfg.Name + "]", Level: lvl,
+			IndependentLevels: true, Output: io.MultiWriter(os.Stderr, ring)}),
 		fsm:   fsm.New(),
 		pg:    cfg.PG,
 		http:  &http.Client{Timeout: 15 * time.Second},
 		beats: map[string]heartbeat{},
+
+		eventKick: make(chan struct{}, 1),
 	}
 	return a, nil
 }
@@ -191,10 +209,23 @@ func (a *Agent) Run(ctx context.Context) error {
 	localSrv := &http.Server{Handler: a.localHandler()}
 	go peerSrv.Serve(peerLn)
 	go localSrv.Serve(localLn)
+	a.router = newRouter(a)
+	for _, l := range []struct {
+		addr string
+		ro   bool
+	}{{a.cfg.ListenRW, false}, {a.cfg.ListenRO, true}} {
+		if l.addr != "" {
+			if err := a.router.listen(ctx, l.addr, l.ro); err != nil {
+				return err
+			}
+		}
+	}
 	a.log.Info("agent started", "raft", a.cfg.RaftAddr, "api", a.cfg.APIAddr, "socket", a.cfg.Socket, "witness", a.cfg.Witness)
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(5)
+	go func() { defer wg.Done(); a.eventLoop(ctx) }()
+	go func() { defer wg.Done(); a.router.run(ctx) }()
 	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
 	go func() { defer wg.Done(); a.reconcileLoop(ctx) }()
 	go func() { defer wg.Done(); a.leaderLoop(ctx) }()
@@ -252,7 +283,9 @@ func (a *Agent) hasQuorum(within time.Duration) bool {
 
 // apply commits a command through Raft (leader only).
 func (a *Agent) apply(c fsm.Command) error {
-	c.Time = time.Now().Unix()
+	if c.Time == 0 {
+		c.Time = time.Now().Unix()
+	}
 	b, _ := json.Marshal(c)
 	f := a.raft.Apply(b, 10*time.Second)
 	if err := f.Error(); err != nil {
@@ -296,6 +329,61 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 			continue
 		}
 		_ = a.peerPost(ctx, addr, "/peer/heartbeat", hb, nil)
+	}
+}
+
+// report records something this agent did in the cluster event history.
+// It never blocks: events are queued and delivered to the Raft leader by
+// eventLoop, so an event raised while partitioned (e.g. "fenced") is
+// recorded once the node can reach the leader again.
+func (a *Agent) report(ctx context.Context, kind, detail string) {
+	// keep the time the event happened, not the time it was delivered
+	c := fsm.Command{Op: "event", Kind: kind, Name: a.cfg.Name, Detail: detail, Time: time.Now().Unix()}
+	a.evMu.Lock()
+	if len(a.pending) < 200 {
+		a.pending = append(a.pending, c)
+	}
+	a.evMu.Unlock()
+	select {
+	case a.eventKick <- struct{}{}:
+	default:
+	}
+}
+
+// eventLoop delivers queued events in order.
+func (a *Agent) eventLoop(ctx context.Context) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		case <-a.eventKick:
+		}
+		for {
+			a.evMu.Lock()
+			if len(a.pending) == 0 {
+				a.evMu.Unlock()
+				break
+			}
+			c := a.pending[0]
+			a.evMu.Unlock()
+			var err error
+			if a.isLeader() {
+				err = a.apply(c)
+			} else if addr, lerr := a.leaderAPI(); lerr != nil {
+				err = lerr
+			} else {
+				err = a.peerPostTimeout(ctx, addr, "/peer/op/record_event", c, nil, 5*time.Second)
+			}
+			if err != nil {
+				break // retry later
+			}
+			a.evMu.Lock()
+			a.pending = a.pending[1:]
+			a.evMu.Unlock()
+		}
 	}
 }
 

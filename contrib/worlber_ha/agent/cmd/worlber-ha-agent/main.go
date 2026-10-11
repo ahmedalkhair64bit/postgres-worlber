@@ -57,6 +57,11 @@ func main() {
 		pgAdv       = flag.String("pg-advertise-host", env("WORLBER_HA_PG_HOST", host), "host other nodes use to reach this PostgreSQL")
 		pgLog       = flag.String("pg-log", "", "log file passed to pg_ctl start (default: <data-dir>/postgresql.log)")
 		socket      = flag.String("socket", "", "unix socket for the SQL extension (default: <pg-socket-dir>/.s.WORLBER_HA.<pg-port>)")
+		listenRW    = flag.String("listen-rw", env("WORLBER_HA_LISTEN_RW", ""), "listener for read-write clients, forwarded to the primary (e.g. 0.0.0.0:5000)")
+		listenRO    = flag.String("listen-ro", env("WORLBER_HA_LISTEN_RO", ""), "listener for read-only clients, spread over standbys (e.g. 0.0.0.0:5001)")
+		vip         = flag.String("vip", env("WORLBER_HA_VIP", ""), "floating IP held by the primary, CIDR form (e.g. 10.0.0.100/24); needs CAP_NET_ADMIN")
+		vipIface    = flag.String("vip-interface", env("WORLBER_HA_VIP_INTERFACE", "eth0"), "network interface for --vip")
+		onRole      = flag.String("on-role-change", env("WORLBER_HA_ON_ROLE_CHANGE", ""), "script run as <script> <primary|replica|stopped> <cluster> <node> when the local role changes")
 		reinit      = flag.Bool("reinit-pgdata", false, "allow replacing a PGDATA that belongs to another database system")
 		tick        = flag.Duration("tick", time.Second, "health check interval")
 		logLevel    = flag.String("log-level", "info", "trace|debug|info|warn|error")
@@ -90,6 +95,7 @@ func main() {
 	a, err := agent.New(agent.Config{
 		Name: *name, DataDir: *dataDir, RaftAddr: *raftAddr, APIAddr: *apiAddr,
 		RaftBind: *raftBind, APIBind: *apiBind,
+		ListenRW: *listenRW, ListenRO: *listenRO, VIP: *vip, VIPInterface: *vipIface, OnRoleChange: *onRole,
 		Socket: *socket, Token: *token, Witness: *witness, PGAdvertise: *pgAdv,
 		ReinitPGData: *reinit, Tick: *tick, LogLevel: *logLevel,
 		PG: &pg.Local{PGData: *pgData, PGBin: *pgBin, SocketDir: *pgSock, Port: *pgPort, User: *pgUser, LogFile: *pgLog},

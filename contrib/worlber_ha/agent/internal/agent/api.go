@@ -124,13 +124,44 @@ func (a *Agent) peerHandler() http.Handler {
 			a.stop()
 		}()
 	})
+	mux.HandleFunc("/peer/log", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Lines int    `json:"lines"`
+			Level string `json:"level"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeReply(w, opResult{Result: a.logs.Tail(clampLines(req.Lines), req.Level)}, nil)
+	})
 	mux.HandleFunc("/peer/release_hold", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		a.holdUntil = time.Time{}
 		a.mu.Unlock()
 		writeReply(w, opResult{}, nil)
 	})
-	return a.requireToken(mux)
+	// Health checks for load balancers (HAProxy, GCP/AWS load balancers):
+	// GET /health/primary -> 200 only on the primary, /health/replica -> 200
+	// only on a streaming standby.  They need no token and expose nothing.
+	outer := http.NewServeMux()
+	outer.HandleFunc("/health", a.health)
+	outer.HandleFunc("/health/", a.health)
+	outer.Handle("/", a.requireToken(mux))
+	return outer
+}
+
+func (a *Agent) health(w http.ResponseWriter, r *http.Request) {
+	code, role := a.router.healthStatus(strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/health"), "/"))
+	w.WriteHeader(code)
+	fmt.Fprintln(w, role)
+}
+
+func clampLines(n int) int {
+	if n <= 0 {
+		return 100
+	}
+	if n > 2000 {
+		return 2000
+	}
+	return n
 }
 
 func (a *Agent) requireToken(next http.Handler) http.Handler {
