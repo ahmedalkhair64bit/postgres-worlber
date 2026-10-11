@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
 	"github.com/worlber/worlber-ha-agent/internal/pg"
@@ -26,7 +27,7 @@ var localOps = map[string]bool{"create_cluster": true, "events": true, "config":
 var leaderOps = map[string]bool{
 	"status": true, "add_node": true, "remove_node": true, "set_sync": true,
 	"set_config": true, "switchover": true, "failover": true,
-	"replication": true, "record_event": true,
+	"replication": true, "record_event": true, "reinit_node": true, "verify_table": true,
 }
 
 // execute dispatches a request from the SQL extension.
@@ -112,6 +113,17 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 		return opResult{Result: a.buildStatus(a.fsm.Get(), false)}, nil
 	case "replication":
 		return opResult{Result: a.replicationStatus(a.fsm.Get())}, nil
+	case "reinit_node":
+		var req struct{ Name string }
+		_ = json.Unmarshal(args, &req)
+		return a.reinitNode(ctx, req.Name)
+	case "verify_table":
+		var req struct {
+			Table string `json:"table"`
+			DB    string `json:"dbname"`
+		}
+		_ = json.Unmarshal(args, &req)
+		return a.verifyTable(ctx, req.DB, req.Table)
 	case "record_event":
 		var c fsm.Command
 		if err := json.Unmarshal(args, &c); err != nil {
@@ -533,7 +545,8 @@ func (a *Agent) switchover(ctx context.Context, target string) (opResult, error)
 	}
 
 	// 3. commit the new primary; agents promote and re-point standbys.
-	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "switchover"}); err != nil {
+	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "switchover",
+		Detail: "no data loss: " + target + " replayed the old primary's shutdown checkpoint " + stop.CheckpointLSN}); err != nil {
 		a.releaseHold(ctx, old)
 		return opResult{}, err
 	}
@@ -610,7 +623,9 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 	if hb, fresh := a.beat(target); !fresh || !hb.Health.Running {
 		return opResult{}, fmt.Errorf("target %q is not running", target)
 	}
-	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "manual_failover"}); err != nil {
+	phb, _ := a.beat(st.Primary)
+	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "manual_failover",
+		Detail: a.lossEstimate(st, target, phb)}); err != nil {
 		return opResult{}, err
 	}
 	return opResult{Result: map[string]any{"old_primary": st.Primary, "new_primary": target}}, nil
@@ -767,4 +782,134 @@ func (a *Agent) replicationStatus(st fsm.State) []replicationRow {
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Node < rows[j].Node })
 	return rows
+}
+
+// reinitNode asks a standby to wipe its data and re-seed from the primary.
+func (a *Agent) reinitNode(ctx context.Context, name string) (opResult, error) {
+	st := a.fsm.Get()
+	n, ok := st.Nodes[name]
+	if !ok {
+		return opResult{}, fmt.Errorf("node %q is not a member", name)
+	}
+	if n.Witness {
+		return opResult{}, fmt.Errorf("node %q is a witness", name)
+	}
+	if st.Primary == name {
+		return opResult{}, errHint("Switch over to another node first.", "cannot re-initialize the primary %q", name)
+	}
+	if err := a.peerPost(ctx, n.APIAddr, "/peer/reinit", map[string]string{"reason": "requested with reinit_node()"}, nil); err != nil {
+		return opResult{}, err
+	}
+	return opResult{Result: map[string]any{"node": name, "state": "re-seeding",
+		"follow": "SELECT node, state, agent_status FROM worlber_ha.cluster_status"}}, nil
+}
+
+// fingerprint is the checksum of one table on one node.
+type fingerprint struct {
+	Node    string `json:"node"`
+	Role    string `json:"role"`
+	LSN     string `json:"lsn"`
+	Rows    int64  `json:"rows"`
+	MD5     string `json:"md5"`
+	Matches *bool  `json:"matches_primary"`
+	Error   string `json:"error,omitempty"`
+}
+
+// verifyTable computes the checksum of a table on the primary, then on each
+// standby once it has replayed up to the primary's LSN, and compares them.
+func (a *Agent) verifyTable(ctx context.Context, db, table string) (opResult, error) {
+	if table == "" {
+		return opResult{}, fmt.Errorf("table is required")
+	}
+	if db == "" {
+		db = "postgres"
+	}
+	st := a.fsm.Get()
+	ask := func(n *fsm.Node, wait string) fingerprint {
+		var fp fingerprint
+		req := map[string]string{"dbname": db, "table": table, "wait_lsn": wait}
+		var err error
+		if n.Name == a.cfg.Name {
+			fp, err = a.localFingerprint(ctx, db, table, wait)
+		} else {
+			err = a.peerPostTimeout(ctx, n.APIAddr, "/peer/fingerprint", req, &fp, 10*time.Minute)
+		}
+		fp.Node, fp.Role = n.Name, st.RoleOf(n.Name)
+		if err != nil {
+			fp.Error = err.Error()
+		}
+		return fp
+	}
+	primary := ask(st.Nodes[st.Primary], "")
+	if primary.Error != "" {
+		return opResult{}, fmt.Errorf("on primary %s: %s", st.Primary, primary.Error)
+	}
+	t := true
+	primary.Matches = &t
+	out := []fingerprint{primary}
+	ch := make(chan fingerprint)
+	count := 0
+	for _, n := range st.SortedNodes() {
+		if n.Name == st.Primary || n.Witness {
+			continue
+		}
+		count++
+		go func(n *fsm.Node) { ch <- ask(n, primary.LSN) }(n)
+	}
+	for i := 0; i < count; i++ {
+		fp := <-ch
+		if fp.Error == "" {
+			m := fp.MD5 == primary.MD5 && fp.Rows == primary.Rows
+			fp.Matches = &m
+		}
+		out = append(out, fp)
+	}
+	sort.Slice(out[1:], func(i, j int) bool { return out[1+i].Node < out[1+j].Node })
+	return opResult{Result: out}, nil
+}
+
+// localFingerprint checksums a table on the local server, after waiting
+// until it has replayed waitLSN (standbys).
+func (a *Agent) localFingerprint(ctx context.Context, db, table, waitLSN string) (fingerprint, error) {
+	var fp fingerprint
+	parts := strings.Split(table, ".")
+	if len(parts) > 2 {
+		return fp, fmt.Errorf("invalid table name %q", table)
+	}
+	ident := pgx.Identifier(parts).Sanitize()
+	cfg, err := pgx.ParseConfig(pg.ConnInfo("host", a.pg.SocketDir, "port", fmt.Sprint(a.pg.Port), "user", a.pg.User,
+		"dbname", db, "connect_timeout", "5", "application_name", "worlber_ha_verify"))
+	if err != nil {
+		return fp, err
+	}
+	c, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fp, err
+	}
+	defer c.Close(context.Background())
+	if waitLSN != "" {
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			var ok bool
+			if err := c.QueryRow(ctx, "SELECT coalesce(pg_last_wal_replay_lsn() >= $1::pg_lsn, true)", waitLSN).Scan(&ok); err != nil {
+				return fp, err
+			}
+			if ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fp, fmt.Errorf("did not replay up to %s within 60s", waitLSN)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return fp, err
+	}
+	defer tx.Rollback(context.Background())
+	err = tx.QueryRow(ctx, `SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END::text,
+	        count(*), coalesce(md5(string_agg(md5(t::text), '' ORDER BY md5(t::text))), md5(''))
+	        FROM `+ident+` t`).Scan(&fp.LSN, &fp.Rows, &fp.MD5)
+	return fp, err
 }

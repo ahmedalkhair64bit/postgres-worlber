@@ -66,21 +66,22 @@ type Agent struct {
 	pg   *pg.Local
 	http *http.Client
 
-	mu          sync.Mutex
-	beats       map[string]heartbeat // leader only
-	local       pg.Health
-	status      string
-	holdUntil   time.Time // don't start PostgreSQL as primary (switchover)
-	holdEpoch   uint64    // ... but only while the epoch is unchanged
-	needRewind  bool
-	noStreamAt  time.Time
-	quorumLost  time.Time
-	wasLeader   bool
-	leaderReady bool   // barrier done in this leadership term
-	readyTerm   string // ... namely this Raft term
-	leaderSince time.Time
-	primaryBad  time.Time
-	lastNoCand  time.Time
+	mu           sync.Mutex
+	beats        map[string]heartbeat // leader only
+	local        pg.Health
+	status       string
+	holdUntil    time.Time // don't start PostgreSQL as primary (switchover)
+	holdEpoch    uint64    // ... but only while the epoch is unchanged
+	needRewind   bool
+	reinitReason string // set by reinit_node: wipe and re-seed this standby
+	noStreamAt   time.Time
+	quorumLost   time.Time
+	wasLeader    bool
+	leaderReady  bool   // barrier done in this leadership term
+	readyTerm    string // ... namely this Raft term
+	leaderSince  time.Time
+	primaryBad   time.Time
+	lastNoCand   time.Time
 
 	opMu sync.Mutex // serializes leader operations (switchover, failover...)
 
@@ -251,6 +252,14 @@ func (a *Agent) setStatus(format string, args ...any) {
 	if changed && s != "" {
 		a.log.Info("status", "status", s)
 	}
+}
+
+// setStatusQuiet updates the status without logging (progress messages).
+func (a *Agent) setStatusQuiet(format string, args ...any) {
+	s := fmt.Sprintf(format, args...)
+	a.mu.Lock()
+	a.status = s
+	a.mu.Unlock()
 }
 
 func (a *Agent) isLeader() bool { return a.raft.State() == raft.Leader }

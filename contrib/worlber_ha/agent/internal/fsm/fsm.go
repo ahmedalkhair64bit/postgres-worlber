@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -32,6 +33,13 @@ var DefaultConfig = map[string]string{
 	"maximum_lag_on_failover": "16MB",
 	"synchronous_mode":        "available", // available | strict
 	"paused":                  "false",
+	// WAL the primary keeps for a disconnected standby before giving up on
+	// it (max_slot_wal_keep_size); protects the primary's disk
+	"max_slot_wal_keep": "100GB",
+	// re-seed a standby automatically when the WAL it needs is gone
+	"auto_reinit": "true",
+	// pg_basebackup --max-rate when seeding (e.g. '100M'); empty = unlimited
+	"seed_max_rate": "",
 }
 
 // Node is one member of the cluster.
@@ -273,7 +281,11 @@ func (s *State) apply(c Command) error {
 		old := s.Primary
 		s.Primary = c.Name
 		s.Epoch++
-		s.event(c.Time, c.Reason, c.Name, fmt.Sprintf("old primary %s", old))
+		detail := fmt.Sprintf("old primary %s", old)
+		if c.Detail != "" {
+			detail += "; " + c.Detail
+		}
+		s.event(c.Time, c.Reason, c.Name, detail)
 
 	case "set_sync":
 		n, ok := s.Nodes[c.Name]
@@ -327,15 +339,27 @@ func ValidateOption(key, value string) error {
 		if value != "available" && value != "strict" {
 			return fmt.Errorf("synchronous_mode must be 'available' or 'strict'")
 		}
-	case "paused":
+	case "paused", "auto_reinit":
 		if value != "true" && value != "false" {
-			return fmt.Errorf("paused must be 'true' or 'false'")
+			return fmt.Errorf("%s must be 'true' or 'false'", key)
+		}
+	case "max_slot_wal_keep":
+		if value != "unlimited" {
+			if n, err := ParseBytes(value); err != nil || n < 1<<20 {
+				return fmt.Errorf("max_slot_wal_keep must be a size >= 1MB (e.g. '100GB') or 'unlimited'")
+			}
+		}
+	case "seed_max_rate":
+		if value != "" && !rateRe.MatchString(value) {
+			return fmt.Errorf("seed_max_rate must be like '50M' or '512k' (per second), or '' for unlimited")
 		}
 	default:
 		return fmt.Errorf("unknown option %q", key)
 	}
 	return nil
 }
+
+var rateRe = regexp.MustCompile(`^[0-9]+[kM]$`)
 
 // ParseBytes parses sizes like "16MB", "1GB", "0", "1048576".
 func ParseBytes(v string) (uint64, error) {

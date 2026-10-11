@@ -132,6 +132,30 @@ func (a *Agent) peerHandler() http.Handler {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		writeReply(w, opResult{Result: a.logs.Tail(clampLines(req.Lines), req.Level)}, nil)
 	})
+	mux.HandleFunc("/peer/reinit", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if a.fsm.Get().RoleOf(a.cfg.Name) != "replica" {
+			writeReply(w, opResult{}, fmt.Errorf("this node is not a replica"))
+			return
+		}
+		a.mu.Lock()
+		a.reinitReason = nonEmpty(req.Reason, "requested")
+		a.mu.Unlock()
+		writeReply(w, opResult{}, nil)
+	})
+	mux.HandleFunc("/peer/fingerprint", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			DB      string `json:"dbname"`
+			Table   string `json:"table"`
+			WaitLSN string `json:"wait_lsn"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		fp, err := a.localFingerprint(r.Context(), req.DB, req.Table, req.WaitLSN)
+		writeReply(w, opResult{Result: fp}, err)
+	})
 	mux.HandleFunc("/peer/release_hold", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		a.holdUntil = time.Time{}

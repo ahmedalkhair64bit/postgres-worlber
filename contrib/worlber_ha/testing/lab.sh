@@ -193,6 +193,13 @@ cmd_test() {
     check "rows replicated to pg3" wait_until 30 "pg3 has 1000 rows" count_is pg3 1000
     check "replicas are read-only" bash -c "! docker compose -f '$COMPOSE' exec -T -u postgres pg2 psql -X -c 'INSERT INTO lab_test VALUES (0)' >/dev/null 2>&1"
 
+    echo "-- every database is replicated (physical replication of the whole instance)"
+    sql pg1 "CREATE DATABASE app2"
+    dc exec -T -u postgres pg1 psql -X -q -d app2 -v ON_ERROR_STOP=1 -c "CREATE TABLE orders (id int PRIMARY KEY, amount numeric); INSERT INTO orders SELECT g, g * 1.5 FROM generate_series(1, 5000) g"
+    check "second database app2 replicated to pg3" wait_until 30 "app2 on pg3" eq 5000 \
+        dc exec -T -u postgres pg3 psql -X -qAt -d app2 -c "SELECT count(*) FROM orders"
+    sql pg1 "CREATE TABLE acked (id int PRIMARY KEY)"
+
     echo; echo "== 1b. synchronous replication"
     sql pg1 "SET synchronous_commit = remote_apply; INSERT INTO lab_test VALUES (1001, 'remote_apply')"
     check "remote_apply: row visible on sync replica pg2 immediately after COMMIT" \
@@ -241,12 +248,38 @@ cmd_test() {
     check "pg1 follows pg2" wait_until 30 "pg1 has 2000 rows" count_is pg1 2000
     check "pg3 follows pg2" wait_until 30 "pg3 has 2000 rows" count_is pg3 2000
 
-    echo; echo "== 3. crash of the primary (pg2): automatic failover"
+    echo; echo "== 3. crash of the primary (pg2) under write load: automatic failover, zero data loss"
+    sql pg2 "SELECT worlber_ha.set_sync('pg1', true)" >/dev/null
+    check "pg1 is the synchronous standby of pg2" wait_until 60 "pg1 quorum" eq "streaming:quorum" \
+        anysql "SELECT state || ':' || sync_state FROM worlber_ha.cluster_status WHERE node = 'pg1'"
+    # A client on pg3 writes one row per transaction through the listener and
+    # logs every id whose COMMIT was acknowledged.
+    dc exec -T pg3 sh -c 'rm -f /tmp/acked /tmp/stop_writer'
+    dc exec -T -d -u postgres -e PGPASSWORD=postgres pg3 bash -c '
+        i=100000
+        while [ ! -e /tmp/stop_writer ]; do
+            if psql -X -qAt -h pg3 -p 5000 -U postgres -d postgres -c "INSERT INTO acked VALUES ($i)" >/dev/null 2>&1; then
+                echo $i >> /tmp/acked
+            fi
+            i=$((i + 1))
+        done'
+    sleep 5
     dc kill pg2 >/dev/null
     check "a new primary was elected" wait_until "$t" "new primary" has_new_primary pg2
     new=$(primary)
     echo "  new primary: $new"
     check "no committed rows lost" count_is "$new" 2000
+    check "synchronous standby pg1 was chosen" test "$new" = pg1
+    sleep 5
+    dc exec -T pg3 touch /tmp/stop_writer
+    sleep 2
+    acked=$(dc exec -T pg3 sh -c 'wc -l < /tmp/acked')
+    echo "  writer: $acked commits acknowledged across the failover"
+    dc exec -T -u postgres -e PGPASSWORD=postgres pg3 psql -X -qAt -h pg3 -p 5000 -U postgres -d postgres \
+        -c "CREATE TEMP TABLE a (id int)" -c "\\copy a FROM '/tmp/acked'" \
+        -c "SELECT count(*) FROM a WHERE id NOT IN (SELECT id FROM acked)" > /tmp/worlber_lab_lost 2>&1 || true
+    check "zero data loss: all $acked acknowledged commits exist on the new primary" test "$(tail -1 /tmp/worlber_lab_lost)" = 0
+    check "failover event shows the data loss estimate" eq t anysql "SELECT detail LIKE '%estimated data loss: none%' FROM worlber_ha.events WHERE kind = 'automatic_failover' ORDER BY seq DESC LIMIT 1"
     check "VIP moved to the new primary $new" wait_until 30 "VIP on $new" dc exec -T "$new" sh -c "ip -o addr show eth0 | grep -q 172.28.0.100"
     check "VIP reaches the new primary" wait_until 30 "VIP rw" eq f viapg pg3 172.28.0.100 5432 "SELECT pg_is_in_recovery()"
     n=pg3; [ "$new" = pg3 ] && n=pg1
@@ -273,6 +306,44 @@ cmd_test() {
     check "healed node $old caught up" wait_until 30 "$old has 4000 rows" count_is "$old" 4000
     # recorded by the isolated node itself, delivered once it could reach the leader again
     check "fencing recorded in events" wait_until 30 "fenced event" eq t anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'fenced' AND node = '$old'"
+
+    echo; echo "== 5b. a replica offline for a long time (WAL it needs is gone): automatic re-seed"
+    p=$(primary)
+    others=()
+    for n in "${NODES[@]}"; do [ "$n" != "$p" ] && others+=("$n"); done
+    r=${others[0]}
+    sql "$p" "SELECT worlber_ha.set_config('max_slot_wal_keep', '64MB')" >/dev/null
+    sleep 3
+    dc stop "$r" >/dev/null
+    echo "  $r stopped; generating ~400MB of WAL on $p"
+    sql "$p" "CREATE TABLE IF NOT EXISTS big (id int, pad text); INSERT INTO big SELECT g, repeat('x', 500) FROM generate_series(1, 700000) g"
+    sql "$p" "CHECKPOINT; SELECT pg_switch_wal(); CHECKPOINT" >/dev/null
+    check "primary protected its disk: slot of $r invalidated" wait_until 60 "slot invalidated" \
+        eq t anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'slot_invalidated' AND detail LIKE 'worlber_ha_$r:%'"
+    dc start "$r" >/dev/null
+    check "$r re-seeded automatically" wait_until 180 "$r reseed event" \
+        eq t anysql "SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'reseed_started' AND node = '$r'"
+    check "$r streaming again after re-seed" wait_until 300 "$r streaming" is_role "$r" replica streaming
+    check "$r has the data written while it was down" wait_until 60 "$r big" eq 700000 sql "$r" "SELECT count(*) FROM big"
+    sql "$p" "SELECT worlber_ha.set_config('max_slot_wal_keep', '100GB')" >/dev/null
+
+    echo; echo "== 5c. manual re-initialization with throttled seeding (reinit_node)"
+    r=${others[1]}
+    sql "$p" "SELECT worlber_ha.set_config('seed_max_rate', '20M')" >/dev/null
+    sql "$p" "SELECT worlber_ha.reinit_node('$r')" >/dev/null
+    check "seeding progress shown in cluster_status" wait_until 60 "progress" \
+        eq t anysql "SELECT agent_status LIKE 'seeding from %\\%%' FROM worlber_ha.cluster_status WHERE node = '$r'"
+    echo "  $(anysql "SELECT agent_status FROM worlber_ha.cluster_status WHERE node = '$r'")"
+    check "$r streaming again after reinit_node" wait_until 300 "$r streaming" is_role "$r" replica streaming
+    sql "$p" "SELECT worlber_ha.set_config('seed_max_rate', '')" >/dev/null
+
+    echo; echo "== 5d. data is identical on every node (verify_table)"
+    for tbl in lab_test acked big; do
+        check "verify_table($tbl): all nodes match the primary" wait_until 60 "verify $tbl" \
+            eq t anysql "SELECT bool_and(matches_primary) AND count(*) = 3 FROM worlber_ha.verify_table('$tbl')"
+    done
+    check "verify_table(orders) in database app2" wait_until 60 "verify app2" \
+        eq t anysql "SELECT bool_and(matches_primary) AND count(*) = 3 FROM worlber_ha.verify_table('orders', 'app2')"
 
     echo; echo "== 6. remove a replica and add it back"
     p=$(primary)

@@ -54,3 +54,29 @@ func TestSyncNames(t *testing.T) {
 		t.Errorf("strict mode: %s", got)
 	}
 }
+
+func TestHumanBytes(t *testing.T) {
+	for in, want := range map[int64]string{0: "0 B", 1023: "1023 B", 1536: "1.5 kB", 1 << 30: "1.0 GB", 1 << 40: "1.0 TB"} {
+		if got := humanBytes(in); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestValidateNewOptions(t *testing.T) {
+	ok := map[string]string{"max_slot_wal_keep": "50GB", "seed_max_rate": "100M", "auto_reinit": "false"}
+	for k, v := range ok {
+		if err := fsm.ValidateOption(k, v); err != nil {
+			t.Errorf("%s=%s: %v", k, v, err)
+		}
+	}
+	if err := fsm.ValidateOption("max_slot_wal_keep", "unlimited"); err != nil {
+		t.Error(err)
+	}
+	bad := map[string]string{"max_slot_wal_keep": "10", "seed_max_rate": "fast", "auto_reinit": "yes"}
+	for k, v := range bad {
+		if err := fsm.ValidateOption(k, v); err == nil {
+			t.Errorf("%s=%s accepted", k, v)
+		}
+	}
+}

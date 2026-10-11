@@ -23,6 +23,7 @@ ORDER BY 1;
  failover
  health_check
  pause
+ reinit_node
  remove_node
  replication_raw
  resume
@@ -30,7 +31,8 @@ ORDER BY 1;
  set_sync
  status
  switchover
-(20 rows)
+ verify_table
+(22 rows)
 
 SELECT c.relname, c.relkind
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -112,11 +114,11 @@ SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
  1.0
 (1 row)
 
-ALTER EXTENSION worlber_ha UPDATE TO '1.1';
+ALTER EXTENSION worlber_ha UPDATE TO '1.2';
 SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
  extversion 
 ------------
- 1.1
+ 1.2
 (1 row)
 
 SELECT count(*) AS blocked_sessions FROM worlber_ha.blocking;

@@ -328,7 +328,7 @@ func (l *Local) ControlData(ctx context.Context) (map[string]string, error) {
 }
 
 // BaseBackup clones a primary into the (empty) PGDATA.
-func (l *Local) BaseBackup(ctx context.Context, conninfo, password, slot string) error {
+func (l *Local) BaseBackup(ctx context.Context, conninfo, password, slot, maxRate string) error {
 	if err := os.MkdirAll(l.PGData, 0700); err != nil {
 		return err
 	}
@@ -337,6 +337,9 @@ func (l *Local) BaseBackup(ctx context.Context, conninfo, password, slot string)
 	args := []string{"-D", l.PGData, "-d", conninfo, "-X", "stream", "-c", "fast", "-R", "--no-password"}
 	if slot != "" {
 		args = append(args, "-S", slot)
+	}
+	if maxRate != "" {
+		args = append(args, "--max-rate", maxRate)
 	}
 	_, err := l.run(ctx, env, "pg_basebackup", args...)
 	return err

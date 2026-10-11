@@ -189,6 +189,14 @@ poll_cluster(
 	'replica:streaming', [$new_primary], 'node2 rejoined as a streaming replica');
 poll_cluster('SELECT count(*) FROM t', '300', [$n2], 'rejoined node2 has all data');
 
+# All three nodes hold exactly the same data.
+is($new_primary->safe_psql('postgres',
+		"SELECT string_agg(node || ':' || matches_primary, ',' ORDER BY node) FROM worlber_ha.verify_table('t')"),
+	'node1:true,node2:true,node3:true', 'verify_table: identical data on every node');
+like($new_primary->safe_psql('postgres',
+		"SELECT detail FROM worlber_ha.events WHERE kind = 'automatic_failover'"),
+	qr/estimated data loss: (none|up to \d+ bytes)/, 'failover event reports the data loss estimate');
+
 my $events = $new_primary->safe_psql('postgres',
 	"SELECT string_agg(kind, ',' ORDER BY seq) FROM worlber_ha.events WHERE kind IN ('cluster_created', 'switchover', 'automatic_failover')");
 is($events, 'cluster_created,switchover,automatic_failover', 'event history recorded');

@@ -161,12 +161,41 @@ func (a *Agent) checkPrimary() {
 		a.mu.Unlock()
 		return
 	}
-	a.log.Warn("automatic failover", "old_primary", st.Primary, "new_primary", name, "down_for", badFor.Round(time.Second))
-	if err := a.apply(fsm.Command{Op: "set_primary", Name: name, ExpectedEpoch: st.Epoch, Reason: "automatic_failover"}); err != nil {
+	loss := a.lossEstimate(st, name, hb)
+	a.log.Warn("automatic failover", "old_primary", st.Primary, "new_primary", name, "down_for", badFor.Round(time.Second), "data_loss", loss)
+	if err := a.apply(fsm.Command{Op: "set_primary", Name: name, ExpectedEpoch: st.Epoch, Reason: "automatic_failover",
+		Detail: fmt.Sprintf("primary down for %s; %s", badFor.Round(time.Second), loss)}); err != nil {
 		a.log.Error("failover commit failed", "error", err)
 		return
 	}
 	a.mu.Lock()
 	a.primaryBad = time.Time{}
 	a.mu.Unlock()
+}
+
+// lossEstimate describes how much committed data a promotion of cand may
+// lose, from the last state the leader saw.
+func (a *Agent) lossEstimate(st fsm.State, cand string, primary heartbeat) string {
+	chb, _ := a.beat(cand)
+	sync := ""
+	for _, r := range primary.Health.Replicas {
+		if r.AppName == cand {
+			sync = r.SyncState
+		}
+	}
+	if sync == "sync" || sync == "quorum" {
+		return "estimated data loss: none (" + cand + " was a synchronous standby)"
+	}
+	if primary.Health.LSN == 0 {
+		return "estimated data loss: unknown (no recent primary status)"
+	}
+	var lag uint64
+	if primary.Health.LSN > chb.Health.LSN {
+		lag = primary.Health.LSN - chb.Health.LSN
+	}
+	ago := "unknown"
+	if !primary.At.IsZero() {
+		ago = time.Since(primary.At).Round(time.Second).String()
+	}
+	return fmt.Sprintf("estimated data loss: up to %d bytes of WAL (asynchronous standby; primary last seen %s ago)", lag, ago)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -132,6 +133,9 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 		a.report(ctx, "promoted", fmt.Sprintf("standby promoted at epoch %d", st.Epoch))
 		return nil
 	}
+	if err := a.ensureSlotLimit(ctx, st); err != nil {
+		return fmt.Errorf("max_slot_wal_keep_size: %w", err)
+	}
 	if err := a.ensureSlots(ctx, st); err != nil {
 		return fmt.Errorf("slots: %w", err)
 	}
@@ -171,8 +175,46 @@ func (a *Agent) synced(ctx context.Context, st fsm.State) bool {
 	return true
 }
 
+// ensureSlotLimit caps the WAL kept for disconnected standbys, so that a
+// standby that is down for days cannot fill the primary's disk.  A standby
+// that falls further behind is re-seeded (auto_reinit) instead.
+func (a *Agent) ensureSlotLimit(ctx context.Context, st fsm.State) error {
+	want := int64(-1)
+	if v := st.Option("max_slot_wal_keep"); v != "unlimited" {
+		n, err := fsm.ParseBytes(v)
+		if err != nil {
+			return err
+		}
+		want = int64(n >> 20) // the setting is in MB
+	}
+	var cur int64
+	if err := a.pg.QueryRow(ctx, "SELECT setting::bigint FROM pg_settings WHERE name = 'max_slot_wal_keep_size'", nil, &cur); err != nil {
+		return err
+	}
+	if cur == want {
+		return nil
+	}
+	if err := a.pg.Exec(ctx, fmt.Sprintf("ALTER SYSTEM SET max_slot_wal_keep_size = '%dMB'", want)); err != nil {
+		return err
+	}
+	a.log.Info("max_slot_wal_keep_size changed", "mb", want)
+	return a.pg.Exec(ctx, "SELECT pg_reload_conf()")
+}
+
 // ensureSlots keeps one physical slot per standby on the primary.
 func (a *Agent) ensureSlots(ctx context.Context, st fsm.State) error {
+	// A slot invalidated by max_slot_wal_keep_size cannot be used anymore:
+	// drop it, it is recreated below and the standby re-seeds.
+	lost, err := a.pg.QueryStrings(ctx, "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'worlber\\_ha\\_%' AND wal_status = 'lost' AND NOT active")
+	if err != nil {
+		return err
+	}
+	for _, sl := range lost {
+		if err := a.pg.Exec(ctx, "SELECT pg_drop_replication_slot($1)", sl); err == nil {
+			a.log.Warn("dropped invalidated replication slot (standby fell behind max_slot_wal_keep)", "slot", sl)
+			a.report(ctx, "slot_invalidated", sl+": standby fell more than max_slot_wal_keep behind; it must be re-seeded")
+		}
+	}
 	have, err := a.pg.QueryStrings(ctx, "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'worlber\\_ha\\_%' AND slot_type = 'physical'")
 	if err != nil {
 		return err
@@ -277,9 +319,19 @@ func (a *Agent) standbySettings(st fsm.State) map[string]*string {
 func (a *Agent) reconcileReplica(ctx context.Context, st fsm.State) error {
 	a.mu.Lock()
 	a.quorumLost = time.Time{}
+	reinit := a.reinitReason
+	a.reinitReason = ""
 	a.mu.Unlock()
 	if !a.synced(ctx, st) {
+		if reinit != "" {
+			a.mu.Lock()
+			a.reinitReason = reinit
+			a.mu.Unlock()
+		}
 		return nil
+	}
+	if reinit != "" && st.Primary != a.cfg.Name {
+		return a.wipeForReseed(ctx, reinit)
 	}
 	if a.pg.DataDirEmpty() {
 		return a.cloneFromPrimary(ctx, st)
@@ -376,9 +428,20 @@ func (a *Agent) followPrimary(ctx context.Context, st fsm.State, h pg.Health) er
 	since := time.Since(a.noStreamAt)
 	a.mu.Unlock()
 	a.setStatus("standby not streaming")
-	// Not streaming for a long time while the primary is up usually means
-	// this standby diverged (e.g. it was ahead of the promoted node).
+	// Not streaming for a long time while the primary is up means either
+	// that the WAL this standby needs is gone (it was down too long), or
+	// that it diverged (e.g. it was ahead of the promoted node).
 	if since > 30*time.Second && a.primaryReachable(ctx, st) {
+		if gone, why := a.walGone(ctx, st, h); gone {
+			a.mu.Lock()
+			a.noStreamAt = time.Time{}
+			a.mu.Unlock()
+			if st.Option("auto_reinit") != "true" {
+				a.setStatus("needs re-seed: %s; run SELECT worlber_ha.reinit_node('%s')", why, a.cfg.Name)
+				return nil
+			}
+			return a.wipeForReseed(ctx, why)
+		}
 		a.log.Warn("standby not streaming for 30s, scheduling rewind")
 		a.report(ctx, "diverged", "standby not streaming for 30s; rewinding from "+st.Primary)
 		a.mu.Lock()
@@ -388,6 +451,76 @@ func (a *Agent) followPrimary(ctx context.Context, st fsm.State, h pg.Health) er
 		return a.pg.Stop(ctx, "fast")
 	}
 	return nil
+}
+
+// walGone reports whether the primary no longer has the WAL this standby
+// needs: its slot was invalidated, or recreated past our position.
+func (a *Agent) walGone(ctx context.Context, st fsm.State, h pg.Health) (bool, string) {
+	p := st.Nodes[st.Primary]
+	if p == nil {
+		return false, ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cfg, err := pgx.ParseConfig(sourceConnInfo(st, p, "worlber_ha_probe"))
+	if err != nil {
+		return false, ""
+	}
+	cfg.Password = st.ReplPassword
+	c, err := pgx.ConnectConfig(cctx, cfg)
+	if err != nil {
+		return false, ""
+	}
+	defer c.Close(cctx)
+	var status, restart *string
+	err = c.QueryRow(cctx, "SELECT wal_status, restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+		st.Nodes[a.cfg.Name].SlotName).Scan(&status, &restart)
+	if err != nil {
+		return false, "" // slot not there yet: the primary recreates it
+	}
+	if status != nil && *status == "lost" {
+		return true, "the WAL this standby needs was removed from the primary (replication slot invalidated by max_slot_wal_keep)"
+	}
+	local := h.LSN
+	if h.ReplayLSN > local {
+		local = h.ReplayLSN
+	}
+	if restart != nil {
+		if r, err := pg.ParseLSN(*restart); err == nil && local > 0 && r > local {
+			return true, fmt.Sprintf("the primary only has WAL from %s, this standby is at %s", *restart, pg.FormatLSN(local))
+		}
+	}
+	return false, ""
+}
+
+// wipeForReseed deletes the data directory of this standby so that the next
+// reconcile seeds it again with pg_basebackup.  Only ever done on a node
+// whose confirmed role is replica.
+func (a *Agent) wipeForReseed(ctx context.Context, why string) error {
+	st := a.fsm.Get()
+	if st.RoleOf(a.cfg.Name) != fsm.RoleReplica {
+		return fmt.Errorf("refusing to wipe PGDATA: this node is not a replica")
+	}
+	a.log.Warn("re-seeding this standby", "reason", why)
+	a.report(ctx, "reseed_started", why)
+	a.setStatus("re-seeding: %s", why)
+	if a.pg.IsRunning() {
+		if err := a.pg.Stop(ctx, "fast"); err != nil {
+			if err := a.pg.Stop(ctx, "immediate"); err != nil {
+				return err
+			}
+		}
+	}
+	ents, err := os.ReadDir(a.pg.PGData)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if err := os.RemoveAll(filepath.Join(a.pg.PGData, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil // the data directory is empty now: cloneFromPrimary follows
 }
 
 func (a *Agent) primaryReachable(ctx context.Context, st fsm.State) bool {
@@ -444,9 +577,13 @@ func (a *Agent) cloneFromPrimary(ctx context.Context, st fsm.State) error {
 	}
 	a.setStatus("seeding: pg_basebackup from %s", p.Name)
 	a.log.Info("starting base backup", "primary", p.Name)
-	a.report(ctx, "seeding_started", "pg_basebackup from "+p.Name)
+	a.report(ctx, "seeding_started", "pg_basebackup from "+p.Name+rateNote(st.Option("seed_max_rate")))
 	began := time.Now()
-	if err := a.pg.BaseBackup(ctx, sourceConnInfo(st, p, a.cfg.Name), st.ReplPassword, slot); err != nil {
+	pctx, stopProgress := context.WithCancel(ctx)
+	go a.seedProgress(pctx, st, p)
+	err := a.pg.BaseBackup(ctx, sourceConnInfo(st, p, a.cfg.Name), st.ReplPassword, slot, st.Option("seed_max_rate"))
+	stopProgress()
+	if err != nil {
 		_ = os.RemoveAll(a.pg.PGData)
 		a.report(ctx, "seeding_failed", err.Error())
 		return err
@@ -462,6 +599,73 @@ func (a *Agent) cloneFromPrimary(ctx context.Context, st fsm.State) error {
 	a.log.Info("standby started", "primary", p.Name)
 	a.setStatus("")
 	return nil
+}
+
+func rateNote(r string) string {
+	if r == "" {
+		return ""
+	}
+	return " (max rate " + r + "/s)"
+}
+
+// seedProgress shows pg_basebackup progress (from pg_stat_progress_basebackup
+// on the primary) in the agent status, e.g. "seeding from pg1: 45% ...".
+func (a *Agent) seedProgress(ctx context.Context, st fsm.State, p *fsm.Node) {
+	cfg, err := pgx.ParseConfig(sourceConnInfo(st, p, "worlber_ha_probe"))
+	if err != nil {
+		return
+	}
+	cfg.Password = st.ReplPassword
+	var c *pgx.Conn
+	defer func() {
+		if c != nil {
+			c.Close(context.Background())
+		}
+	}()
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if c == nil || c.IsClosed() {
+			if c, err = pgx.ConnectConfig(ctx, cfg); err != nil {
+				c = nil
+				continue
+			}
+		}
+		var phase string
+		var done, total *int64
+		err := c.QueryRow(ctx, `SELECT b.phase, b.backup_streamed, b.backup_total
+			FROM pg_stat_progress_basebackup b JOIN pg_stat_activity a USING (pid)
+			WHERE a.application_name = $1`, a.cfg.Name).Scan(&phase, &done, &total)
+		if err != nil {
+			continue
+		}
+		msg := fmt.Sprintf("seeding from %s: %s", p.Name, phase)
+		if done != nil && total != nil && *total > 0 {
+			msg = fmt.Sprintf("seeding from %s: %d%% (%s of %s), %s", p.Name, *done*100 / *total,
+				humanBytes(*done), humanBytes(*total), phase)
+		} else if done != nil {
+			msg = fmt.Sprintf("seeding from %s: %s copied, %s", p.Name, humanBytes(*done), phase)
+		}
+		a.setStatusQuiet("%s", msg)
+	}
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "kMGTPE"[exp])
 }
 
 func (a *Agent) slotExists(ctx context.Context, st fsm.State, p *fsm.Node, slot string) bool {

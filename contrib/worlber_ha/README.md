@@ -128,6 +128,8 @@ All objects live in schema `worlber_ha`. Management needs superuser or the role
 | `failover(target => NULL, force => false)` | forced failover; `force` = `FORCE_FAILOVER_ALLOW_DATA_LOSS` |
 | `set_sync(node, true/false)` | `AVAILABILITY_MODE = SYNCHRONOUS_COMMIT / ASYNCHRONOUS_COMMIT` |
 | `set_config(option, value)` | cluster options, see below |
+| `reinit_node(node)` | wipe a standby and seed it again from the primary (after a long outage) |
+| `verify_table(table, dbname)` | checksum of a table on every node at the same LSN, with `matches_primary` |
 | `pause()` / `resume()` | maintenance mode: no automatic failover, agents leave PostgreSQL alone |
 | `connection_string(dbname, read_only => false)` | multi-host libpq URI with `target_session_attrs` |
 | `health_check()` | one row per problem (`CRITICAL`/`WARNING`), or a single `OK` row |
@@ -150,6 +152,9 @@ Options:
 | `maximum_lag_on_failover` | `16MB` | a standby lagging more than this is not promoted automatically |
 | `synchronous_mode` | `available` | `available`: sync standbys that are connected are required (commits continue if all are down). `strict`: commits wait until a sync standby is back, and only a sync standby can be promoted (zero data loss) |
 | `paused` | `false` | set by `pause()` / `resume()` |
+| `max_slot_wal_keep` | `100GB` | most WAL the primary keeps for a disconnected standby (`max_slot_wal_keep_size`); `'unlimited'` to never give up |
+| `auto_reinit` | `true` | re-seed a standby automatically when the WAL it needs is gone |
+| `seed_max_rate` | (unlimited) | `pg_basebackup --max-rate` for seeding, e.g. `'200M'` |
 
 GUCs: `worlber_ha.agent_socket` (default
 `<first unix_socket_directories>/.s.WORLBER_HA.<port>`, the same default the
@@ -207,6 +212,63 @@ does not copy data itself.
    are re-pointed to it with ALTER SYSTEM `primary_conninfo` and a reload. The
    old primary is synchronized with `pg_rewind` and restarted as a standby.
 
+## Reliability questions
+
+**Multiple databases.** Replication is physical. Every database of the
+instance (everything in `\l`, including new ones created later), every role
+and every tablespace is replicated and fails over together. It is like an
+availability group that contains all databases. There is nothing to configure
+per database.
+
+**A replica was offline for 2 days.**
+1. While a replica is down, the primary keeps the WAL it needs in the
+   replica's replication slot.
+2. When the replica comes back, it catches up automatically from that WAL. No
+   full copy is needed.
+3. To protect the primary's disk, it keeps at most `max_slot_wal_keep` of WAL
+   per replica (default `100GB`; set it to what your disk can hold, with
+   `set_config('max_slot_wal_keep', '500GB')`).
+4. If the replica fell further behind, the primary invalidates its slot
+   (event `slot_invalidated`), and its disk is safe.
+5. When the replica returns, its agent sees that the WAL it needs is gone. It
+   re-seeds the replica with a fresh `pg_basebackup` (events `reseed_started`,
+   `seeding_completed`). To do this by hand instead, set
+   `set_config('auto_reinit', 'false')`. `cluster_status.agent_status` then
+   says "needs re-seed", and you run `SELECT worlber_ha.reinit_node('pg2')`
+   when it suits you.
+
+**Adding a node to a 1 TB database.**
+* `add_node` seeds the new node with `pg_basebackup`, a full physical copy of
+  all databases streamed from the primary. Writes continue on the primary
+  while it runs; the WAL produced meanwhile is streamed afterwards, so the
+  replica ends up exactly in sync.
+* Time is about size / bandwidth: 1 TB takes about 2.5 hours at 1 Gbit/s and
+  about 20 minutes at 10 Gbit/s.
+* Use `add_node('pg3', wait => false)` and follow progress in
+  `SELECT node, agent_status FROM worlber_ha.cluster_status`. It shows, for
+  example: `seeding from pg1: 45% (450.0 GB of 1.0 TB), streaming database
+  files`.
+* `set_config('seed_max_rate', '200M')` limits the copy to 200 MB/s so that it
+  does not saturate the primary's disk or network.
+* The new node only becomes a failover candidate once it is streaming.
+
+**Seeing data loss.**
+
+| Question | Command |
+|---|---|
+| How much would I lose if I fail over now? | `SELECT node, sync_state, data_loss_if_failover_now FROM worlber_ha.replication;`: `none (synchronous)` for sync standbys, otherwise the WAL not yet received |
+| How much was lost in the last failover? | `SELECT event_time, detail FROM worlber_ha.events WHERE kind IN ('automatic_failover', 'manual_failover', 'switchover');`: each event records the estimate, e.g. `estimated data loss: none (pg2 was a synchronous standby)` |
+| Are the replicas really identical? | `SELECT * FROM worlber_ha.verify_table('orders');` (and `verify_table('orders', 'app2')` for another database): checksum and row count on every node at the same LSN, plus `matches_primary` |
+| Can a failover lose committed transactions? | Not if the new primary is a synchronous standby (always chosen first). With `synchronous_mode = 'strict'`, only a synchronous standby can be promoted, so committed transactions are never lost. |
+
+The lab suite (`testing/lab.sh test`) verifies all of this:
+* it kills the primary while a client is committing through the listener, then
+  checks that every acknowledged commit exists on the new primary;
+* it leaves a replica down while 400 MB of WAL is written with
+  `max_slot_wal_keep = 64MB`, then checks the automatic re-seed;
+* it runs `reinit_node` with a throttled seed;
+* it compares table checksums across all nodes, in two databases.
+
 ## Monitoring cheat sheet
 
 ```sql
@@ -251,4 +313,4 @@ through `pg_rewind`.
 * Agent-to-agent traffic (API and Raft) is plain TCP, authenticated by the
   shared token. Put it on a private network until TLS (mTLS) is added. The
   replication password is stored in the Raft state (`--data-dir`, mode 0700).
-* Read-only routing lists and backup preferences are not implemented yet.
+* Backup preferences (which node runs backups) are not implemented yet.
