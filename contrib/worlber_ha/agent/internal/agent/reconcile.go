@@ -39,6 +39,15 @@ func (a *Agent) reconcileLoop(ctx context.Context) {
 func (a *Agent) reconcile(ctx context.Context) error {
 	st := a.fsm.Get()
 	if _, member := st.Nodes[a.cfg.Name]; !member {
+		// An agent that never joined a cluster manages a standalone server:
+		// start it so that the DBA can connect and run create_cluster().
+		if !st.Bootstrapped() && !a.info().HasRaft && a.pg.HasDataDir() &&
+			!a.pg.HasStandbySignal() && !a.pg.IsRunning() {
+			a.setStatus("starting standalone server")
+			if err := a.pg.Start(ctx); err != nil {
+				return err
+			}
+		}
 		if st.Bootstrapped() {
 			a.setStatus("not a member of cluster %s", st.ClusterName)
 		} else {

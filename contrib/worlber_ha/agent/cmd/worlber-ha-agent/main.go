@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +30,13 @@ func env(key, def string) string {
 	return def
 }
 
+func envInt(key string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
+}
+
 func main() {
 	host, _ := os.Hostname()
 	var (
@@ -36,13 +44,15 @@ func main() {
 		dataDir     = flag.String("data-dir", env("WORLBER_HA_DATA_DIR", "/var/lib/worlber_ha"), "directory for Raft state")
 		raftAddr    = flag.String("raft-addr", env("WORLBER_HA_RAFT_ADDR", host+":7401"), "host:port for Raft traffic (bound and advertised)")
 		apiAddr     = flag.String("api-addr", env("WORLBER_HA_API_ADDR", host+":7400"), "host:port for the agent peer API (bound and advertised)")
+		raftBind    = flag.String("raft-bind", env("WORLBER_HA_RAFT_BIND", ""), "listen address for Raft (default: --raft-addr), e.g. 0.0.0.0:7401")
+		apiBind     = flag.String("api-bind", env("WORLBER_HA_API_BIND", ""), "listen address for the peer API (default: --api-addr), e.g. 0.0.0.0:7400")
 		token       = flag.String("token", env("WORLBER_HA_TOKEN", ""), "shared cluster secret (same on every node)")
 		tokenFile   = flag.String("token-file", env("WORLBER_HA_TOKEN_FILE", ""), "file containing the cluster secret")
 		witness     = flag.Bool("witness", false, "run as a witness (Raft vote only, no PostgreSQL)")
 		pgData      = flag.String("pgdata", env("PGDATA", ""), "PostgreSQL data directory")
 		pgBin       = flag.String("pgbin", env("WORLBER_HA_PGBIN", ""), "directory with pg_ctl, pg_basebackup, pg_rewind")
 		pgSock      = flag.String("pg-socket-dir", env("WORLBER_HA_PG_SOCKET_DIR", "/var/run/postgresql"), "unix socket directory of the local PostgreSQL")
-		pgPort      = flag.Int("pg-port", 5432, "port of the local PostgreSQL")
+		pgPort      = flag.Int("pg-port", envInt("WORLBER_HA_PG_PORT", 5432), "port of the local PostgreSQL")
 		pgUser      = flag.String("pg-user", env("WORLBER_HA_PG_USER", "postgres"), "superuser the agent connects as (local socket)")
 		pgAdv       = flag.String("pg-advertise-host", env("WORLBER_HA_PG_HOST", host), "host other nodes use to reach this PostgreSQL")
 		pgLog       = flag.String("pg-log", "", "log file passed to pg_ctl start (default: <data-dir>/postgresql.log)")
@@ -79,6 +89,7 @@ func main() {
 
 	a, err := agent.New(agent.Config{
 		Name: *name, DataDir: *dataDir, RaftAddr: *raftAddr, APIAddr: *apiAddr,
+		RaftBind: *raftBind, APIBind: *apiBind,
 		Socket: *socket, Token: *token, Witness: *witness, PGAdvertise: *pgAdv,
 		ReinitPGData: *reinit, Tick: *tick, LogLevel: *logLevel,
 		PG: &pg.Local{PGData: *pgData, PGBin: *pgBin, SocketDir: *pgSock, Port: *pgPort, User: *pgUser, LogFile: *pgLog},

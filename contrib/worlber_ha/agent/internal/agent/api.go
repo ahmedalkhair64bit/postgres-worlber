@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // reply is the envelope returned to the SQL extension and to peers.
@@ -100,6 +104,25 @@ func (a *Agent) peerHandler() http.Handler {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		lsn, err := a.stopForSwitchover(r.Context(), req.Epoch)
 		writeReply(w, opResult{Result: map[string]any{"checkpoint_lsn": lsn}}, err)
+	})
+	mux.HandleFunc("/peer/leave", func(w http.ResponseWriter, r *http.Request) {
+		// Sent by the leader after remove_node: remember to reset Raft state
+		// and exit; the service manager restarts the agent as a fresh node.
+		// PostgreSQL is left running.
+		if a.raft.State() == raft.Leader {
+			writeReply(w, opResult{}, fmt.Errorf("refusing to leave while Raft leader"))
+			return
+		}
+		if err := os.WriteFile(filepath.Join(a.cfg.DataDir, leftMarker), nil, 0600); err != nil {
+			writeReply(w, opResult{}, err)
+			return
+		}
+		writeReply(w, opResult{}, nil)
+		a.log.Warn("removed from the cluster; exiting so that the agent restarts as a new node")
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			a.stop()
+		}()
 	})
 	mux.HandleFunc("/peer/release_hold", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()

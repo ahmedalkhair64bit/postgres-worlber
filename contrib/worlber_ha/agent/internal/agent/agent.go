@@ -27,8 +27,10 @@ import (
 type Config struct {
 	Name         string
 	DataDir      string // raft state
-	RaftAddr     string // host:port, bound and advertised
-	APIAddr      string // host:port of the peer API, bound and advertised
+	RaftAddr     string // host:port other agents use for Raft
+	APIAddr      string // host:port other agents use for the peer API
+	RaftBind     string // listen address for Raft (default RaftAddr)
+	APIBind      string // listen address for the peer API (default APIAddr)
 	Socket       string // local unix socket for the SQL extension
 	Token        string // shared cluster secret
 	Witness      bool
@@ -75,7 +77,13 @@ type Agent struct {
 	lastNoCand  time.Time
 
 	opMu sync.Mutex // serializes leader operations (switchover, failover...)
+
+	stop context.CancelFunc // ends Run (used when removed from the cluster)
 }
+
+// leftMarker is created when this node was removed from its cluster; on the
+// next start the Raft state is wiped so the node can join a cluster again.
+const leftMarker = "LEFT_CLUSTER"
 
 // New creates an agent; call Run to start it.
 func New(cfg Config) (*Agent, error) {
@@ -123,6 +131,12 @@ func (a *Agent) startRaft() error {
 	rc.LeaderLeaseTimeout = 500 * time.Millisecond
 	rc.SnapshotThreshold = 1024
 
+	if _, err := os.Stat(filepath.Join(a.cfg.DataDir, leftMarker)); err == nil {
+		a.log.Warn("this node was removed from its cluster; resetting Raft state")
+		_ = os.Remove(filepath.Join(a.cfg.DataDir, "raft.db"))
+		_ = os.RemoveAll(filepath.Join(a.cfg.DataDir, "snapshots"))
+		_ = os.Remove(filepath.Join(a.cfg.DataDir, leftMarker))
+	}
 	store, err := raftboltdb.NewBoltStore(filepath.Join(a.cfg.DataDir, "raft.db"))
 	if err != nil {
 		return fmt.Errorf("raft store: %w", err)
@@ -135,7 +149,11 @@ func (a *Agent) startRaft() error {
 	if err != nil {
 		return fmt.Errorf("raft address: %w", err)
 	}
-	trans, err := raft.NewTCPTransportWithLogger(a.cfg.RaftAddr, addr, 3, 10*time.Second, rl.Named("net"))
+	bind := a.cfg.RaftBind
+	if bind == "" {
+		bind = a.cfg.RaftAddr
+	}
+	trans, err := raft.NewTCPTransportWithLogger(bind, addr, 3, 10*time.Second, rl.Named("net"))
 	if err != nil {
 		return fmt.Errorf("raft transport: %w", err)
 	}
@@ -149,10 +167,16 @@ func (a *Agent) startRaft() error {
 
 // Run starts all servers and loops; it returns when ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
+	ctx, a.stop = context.WithCancel(ctx)
+	defer a.stop()
 	if err := a.startRaft(); err != nil {
 		return err
 	}
-	peerLn, err := net.Listen("tcp", a.cfg.APIAddr)
+	apiBind := a.cfg.APIBind
+	if apiBind == "" {
+		apiBind = a.cfg.APIAddr
+	}
+	peerLn, err := net.Listen("tcp", apiBind)
 	if err != nil {
 		return fmt.Errorf("peer API: %w", err)
 	}

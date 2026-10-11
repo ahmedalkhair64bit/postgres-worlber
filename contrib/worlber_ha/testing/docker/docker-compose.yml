@@ -1,0 +1,71 @@
+# worlber_ha 3-node lab (+ optional witness).
+#
+#   cd contrib/worlber_ha/testing && ./lab.sh up && ./lab.sh setup
+#
+# Hosts:  pg1 (initial primary), pg2, pg3 on network worlber-lab-net.
+# Ports on the docker host: 5441-5443 -> PostgreSQL on pg1-pg3.
+name: worlber-lab
+
+x-node: &node
+  image: worlber-pg:lab
+  build:
+    context: ../../../..
+    dockerfile: contrib/worlber_ha/testing/docker/Dockerfile
+  environment: &env
+    WORLBER_HA_TOKEN: lab-secret-change-me
+    POSTGRES_PASSWORD: postgres
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  pg1:
+    <<: *node
+    hostname: pg1
+    environment:
+      <<: *env
+      NODE_NAME: pg1
+      INIT_PRIMARY: "1"
+    ports: ["5441:5432"]
+    volumes: [pg1:/var/lib/postgresql, pg1state:/var/lib/worlber_ha]
+    networks: {lab: {ipv4_address: 172.28.0.11}}
+
+  pg2:
+    <<: *node
+    hostname: pg2
+    environment: {<<: *env, NODE_NAME: pg2}
+    ports: ["5442:5432"]
+    volumes: [pg2:/var/lib/postgresql, pg2state:/var/lib/worlber_ha]
+    networks: {lab: {ipv4_address: 172.28.0.12}}
+
+  pg3:
+    <<: *node
+    hostname: pg3
+    environment: {<<: *env, NODE_NAME: pg3}
+    ports: ["5443:5432"]
+    volumes: [pg3:/var/lib/postgresql, pg3state:/var/lib/worlber_ha]
+    networks: {lab: {ipv4_address: 172.28.0.13}}
+
+  # Optional witness: docker compose --profile witness up -d
+  witness:
+    <<: *node
+    profiles: [witness]
+    hostname: witness
+    environment: {<<: *env, NODE_NAME: witness}
+    command: ["--witness"]
+    volumes: [witnessstate:/var/lib/worlber_ha]
+    networks: {lab: {ipv4_address: 172.28.0.20}}
+
+networks:
+  lab:
+    name: worlber-lab-net
+    ipam:
+      config: [{subnet: 172.28.0.0/24}]
+
+volumes:
+  pg1: {}
+  pg2: {}
+  pg3: {}
+  pg1state: {}
+  pg2state: {}
+  pg3state: {}
+  witnessstate: {}

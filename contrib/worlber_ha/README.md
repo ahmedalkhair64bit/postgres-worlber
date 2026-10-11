@@ -91,7 +91,10 @@ worlber-ha-agent \
   --data-dir /var/lib/worlber_ha
 ```
 
-* On the **primary**, PostgreSQL is already running.
+* On the **primary**, the agent starts PostgreSQL itself if it is not
+  running. This only happens while the node has never been in a cluster.
+* Use `--api-bind 0.0.0.0:7400 --raft-bind 0.0.0.0:7401` to listen on all
+  interfaces while advertising `--api-addr`/`--raft-addr`.
 * On a **new replica**, leave `--pgdata` empty or absent. The agent fills it with
   `pg_basebackup` when the node is added. A data directory that belongs to
   another database system is never overwritten unless you pass
@@ -120,7 +123,7 @@ All objects live in schema `worlber_ha`. Management needs superuser or the role
 | `create_cluster(name, synchronous_mode => 'available', failover_timeout => '30s')` | `CREATE AVAILABILITY GROUP` on the current primary |
 | `add_node(host, agent_port => 7400, sync => false, wait => true, timeout_s => 900)` | `ADD REPLICA` with automatic seeding; waits until it streams |
 | `add_witness(host, agent_port => 7400)` | file share witness |
-| `remove_node(node)` | `REMOVE REPLICA` |
+| `remove_node(node)` | `REMOVE REPLICA`; the removed agent resets its state and restarts, so it can be added again |
 | `switchover(target => NULL)` | planned manual failover, no data loss (NULL = best standby) |
 | `failover(target => NULL, force => false)` | forced failover; `force` = `FORCE_FAILOVER_ALLOW_DATA_LOSS` |
 | `set_sync(node, true/false)` | `AVAILABILITY_MODE = SYNCHRONOUS_COMMIT / ASYNCHRONOUS_COMMIT` |
@@ -149,6 +152,10 @@ agent uses) and `worlber_ha.agent_timeout` (default 30s).
 
 ## Testing
 
+**To try it, start with [`testing/TESTING.md`](testing/TESTING.md).** It has
+a ready-made Docker lab (`testing/lab.sh up && testing/lab.sh test`), a
+step-by-step guide for three VMs, and a test plan.
+
 ```sh
 make -C contrib/worlber_ha agent-check          # Go unit tests
 make -C contrib/worlber_ha agent
@@ -171,5 +178,4 @@ through `pg_rewind`.
 * No virtual IP yet. Applications use `connection_string()` (libpq multi-host
   with `target_session_attrs=read-write`), or a proxy such as HAProxy that
   checks `pg_is_in_recovery()`.
-* A removed node keeps its Raft data. Wipe `--data-dir` before adding it again.
 * Read-only routing lists and backup preferences are not implemented yet.

@@ -95,7 +95,7 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	case "remove_node":
 		var req struct{ Name string }
 		_ = json.Unmarshal(args, &req)
-		return a.removeNode(req.Name)
+		return a.removeNode(ctx, req.Name)
 	case "set_sync":
 		var req struct {
 			Name string
@@ -361,26 +361,38 @@ func (a *Agent) addNode(ctx context.Context, args json.RawMessage) (opResult, er
 	return opResult{Result: res, Warnings: []string{"node added but not streaming yet; check worlber_ha.cluster_status"}}, nil
 }
 
-func (a *Agent) removeNode(name string) (opResult, error) {
+func (a *Agent) removeNode(ctx context.Context, name string) (opResult, error) {
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
 	st := a.fsm.Get()
-	if _, ok := st.Nodes[name]; !ok {
+	n, ok := st.Nodes[name]
+	if !ok {
 		return opResult{}, fmt.Errorf("node %q is not a member", name)
 	}
 	if st.Primary == name {
 		return opResult{}, errHint("Run worlber_ha.switchover() to another node first.", "cannot remove the primary %q", name)
 	}
+	if name == a.cfg.Name {
+		// hand leadership to another node first; the new leader removes us
+		if err := a.raft.LeadershipTransfer().Error(); err != nil {
+			return opResult{}, fmt.Errorf("leadership transfer: %w", err)
+		}
+		return opResult{}, errHint("Run remove_node() again.", "this agent was the Raft leader; leadership has been transferred")
+	}
 	if err := a.apply(fsm.Command{Op: "remove_node", Name: name}); err != nil {
 		return opResult{}, err
 	}
+	var warnings []string
 	if err := a.raft.RemoveServer(raft.ServerID(name), 0, 15*time.Second).Error(); err != nil {
-		return opResult{Result: "ok", Warnings: []string{"raft remove server: " + err.Error()}}, nil
+		warnings = append(warnings, "raft remove server: "+err.Error())
 	}
 	a.mu.Lock()
 	delete(a.beats, name)
 	a.mu.Unlock()
-	return opResult{Result: "ok"}, nil
+	if err := a.peerPost(ctx, n.APIAddr, "/peer/leave", nil, nil); err != nil {
+		warnings = append(warnings, fmt.Sprintf("could not tell %s to leave (%v); before adding it again, stop its agent and delete its --data-dir", name, err))
+	}
+	return opResult{Result: "ok", Warnings: warnings}, nil
 }
 
 // candidates returns failover candidates from the leader's heartbeats.
