@@ -1,0 +1,7 @@
+# worlber_ha extension
+comment = 'Worlber HA: availability groups for PostgreSQL managed from SQL'
+default_version = '1.0'
+module_pathname = '$libdir/worlber_ha'
+relocatable = false
+schema = worlber_ha
+superuser = true

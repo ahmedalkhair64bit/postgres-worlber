@@ -1,0 +1,81 @@
+--
+-- worlber_ha without a running agent: objects, privileges and error paths.
+-- The full cluster lifecycle is covered by the TAP test t/001_cluster.pl.
+--
+CREATE EXTENSION worlber_ha;
+-- objects created by the extension
+SELECT p.proname
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'worlber_ha'
+ORDER BY 1;
+      proname      
+-------------------
+ add_node
+ add_witness
+ agent_request
+ agent_socket_path
+ call
+ config
+ connection_string
+ create_cluster
+ event_log
+ failover
+ pause
+ remove_node
+ resume
+ set_config
+ set_sync
+ status
+ switchover
+(17 rows)
+
+SELECT c.relname, c.relkind
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'worlber_ha'
+ORDER BY 1;
+    relname     | relkind 
+----------------+---------
+ cluster_config | v
+ cluster_status | v
+ events         | v
+(3 rows)
+
+-- management is restricted, monitoring is open to pg_monitor
+SELECT has_function_privilege('public', 'worlber_ha.switchover(text)', 'EXECUTE') AS public_switchover,
+       has_function_privilege('worlber_ha_admin', 'worlber_ha.switchover(text)', 'EXECUTE') AS admin_switchover,
+       has_function_privilege('pg_monitor', 'worlber_ha.status()', 'EXECUTE') AS monitor_status,
+       has_function_privilege('pg_monitor', 'worlber_ha.failover(text, boolean)', 'EXECUTE') AS monitor_failover,
+       has_table_privilege('pg_monitor', 'worlber_ha.cluster_status', 'SELECT') AS monitor_view;
+ public_switchover | admin_switchover | monitor_status | monitor_failover | monitor_view 
+-------------------+------------------+----------------+------------------+--------------
+ f                 | t                | t              | f                | t
+(1 row)
+
+-- no agent listening
+SET worlber_ha.agent_socket = '/nonexistent/worlber_ha.sock';
+SELECT worlber_ha.agent_socket_path();
+      agent_socket_path       
+------------------------------
+ /nonexistent/worlber_ha.sock
+(1 row)
+
+SELECT * FROM worlber_ha.cluster_status;
+ERROR:  could not connect to the worlber_ha agent at "/nonexistent/worlber_ha.sock": No such file or directory
+HINT:  Start worlber-ha-agent on this node, or set worlber_ha.agent_socket.
+CONTEXT:  PL/pgSQL function worlber_ha.call(text,jsonb,integer) line 6 at assignment
+SQL function "status" statement 1
+SELECT worlber_ha.create_cluster('prod');
+ERROR:  could not connect to the worlber_ha agent at "/nonexistent/worlber_ha.sock": No such file or directory
+HINT:  Start worlber-ha-agent on this node, or set worlber_ha.agent_socket.
+CONTEXT:  PL/pgSQL function worlber_ha.call(text,jsonb,integer) line 6 at assignment
+-- argument validation happens before contacting the agent
+SELECT worlber_ha.agent_request('bad-op');
+ERROR:  invalid worlber_ha operation "bad-op"
+SELECT worlber_ha.agent_request(NULL);
+ERROR:  operation must not be null
+SET worlber_ha.agent_timeout = 0;
+ERROR:  0 s is outside the valid range for parameter "worlber_ha.agent_timeout" (1 s .. 86400 s)
+RESET worlber_ha.agent_timeout;
+RESET worlber_ha.agent_socket;
+DROP EXTENSION worlber_ha;
+DROP ROLE worlber_ha_admin;
