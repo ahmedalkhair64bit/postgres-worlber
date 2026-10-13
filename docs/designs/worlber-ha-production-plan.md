@@ -597,17 +597,167 @@ README "how data replicates" diagram: still accurate for 1.2; must gain the arch
 +====================================================================+
 ```
 
+# Eng Review (/plan-eng-review, 2026-10-13)
+Target: docs/designs/worlber-ha-production-plan.md + docs/designs/worlber-ha-production-proof.md.
+Binding: B1 leave encryption alone; B2 psql-level management. Prior learning applied: ha-agent-death-unfenced (9/10).
+
+## Step 0: Scope Challenge
+- Complexity: >8 files, several new components (fence.c, init.go, proof.go, worlber-ledger, chaos runner). Scope was set by the CEO review (D2–D16, D12) and is **accepted as-is**; no feature cuts proposed. Arrangement: keep agent logic in `internal/agent` + `internal/fsm`; new pure decision functions go in a new `internal/safety` package (from D1), so tests need no Raft or PostgreSQL.
+- Reality rows:
+  - REALITY: premise-table pass 7 premises, 3 unverified (P5–P7) docs/designs/worlber-ha-production-plan.md:16
+  - REALITY: already-done pass master bb1caab has 1.1 only; none of W1–W10 exists contrib/worlber_ha/agent/internal/agent/reconcile.go:265 (still `ANY 1`)
+  - REALITY: surface-check finding plan says "each PR: Go tests and the regression test" but .github/workflows has only pg-ci.yml with no worlber_ha/go test job .github/workflows/pg-ci.yml:11
+  - REALITY: binding-decisions pass B1/B2 respected; no TLS added; all ops via SQL docs/designs/worlber-ha-production-plan.md:5
+  - REALITY: numbers pass failover/rewind numbers tagged [measured: lab events]; 20h lab budget [estimated] docs/designs/worlber-ha-production-plan.md:295
+  - REALITY: deferred-asks pass user asks (psql config, add/remove replica, failover, monitoring, load, VIP, high volume, fast recovery) all mapped to W1–W10 docs/designs/worlber-ha-production-plan.md:9
+  - REALITY: pr-count n/a no ship-policy.json; one PR per work item recommended (see lanes)
+- Scope Challenge result: **scope accepted as-is**.
+
+## Section 1: Architecture
+- `[P1] (confidence: 8/10) contrib/worlber_ha/agent/internal/fsm/fsm.go:241` — version gate race. The plan has the leader check "all members ≥ 1.3" from in-memory heartbeats, then commit `gate_open`. An `add_node` of a 1.2 agent committed between the check and the commit leaves a 1.2 member behind an open gate, and its FSM then rejects 1.3 ops (`fsm.go:313-314 default: return fmt.Errorf("unknown op %q", c.Op)`), so the FSMs diverge. **Fix (needed for W8's approved "FSMs never diverge" contract):** `gate_open` carries the member set and the versions the leader saw; `apply` rejects it when the FSM node set differs. This is deterministic and needs no new pre-gate op.
+- `[P1] (confidence: 9/10) .github/workflows/pg-ci.yml:11` — no CI job builds or tests the agent or worlber_ha on PRs, although the plan's Distribution Plan says "each PR: Go tests and the regression test". **Fix (needed for that approved text):** add `.github/workflows/worlber-ha-ci.yml` (on `pull_request` with a paths filter on `contrib/worlber_ha/**`): `go vet`, `go test ./...`, then `make -C contrib/worlber_ha installcheck` and the TAP tests. Part of W7.
+- `[P2] (confidence: 9/10) contrib/worlber_ha/agent/internal/agent/api.go:171` — `outer.Handle("/", a.requireToken(mux))` puts every route behind the token. `/peer/join` has to be registered on `outer` (like `/health`). It is authenticated by the nonce only, and rate-limited by `r.RemoteAddr`, never by `X-Forwarded-For`. Spec clarification for W10/D16.
+- `[P2] (confidence: 9/10)` distribution: no release workflow exists, but W10 says "built with nfpm in the release workflow". **Fix:** add `.github/workflows/worlber-ha-release.yml` on `worlber-ha-v*` tags: static agent binaries (amd64, arm64), nfpm .deb/.rpm, SHA256SUMS, attached to the GitHub release.
+- Checked and OK (null results):
+  - lease stamped at check time and anchored at heartbeat send time (design doc lines 185, 199);
+  - new leader timer = max(last heartbeat, leaderSince) (`failover.go:124-127` matches);
+  - snapshot `Restore` uses `json.Decoder` without `DisallowUnknownFields` (`fsm.go:417`), so a pre-gate 1.2 downgrade (D15) can restore a 1.3 snapshot;
+  - Raft `LeaderLeaseTimeout = 500ms` (`agent.go:150`) is below Q = 2s.
+
+```
+psql ─► extension ─unix─► agent ──┬─ internal/safety (NEW, pure: renew?, fenceDeadline, candidate, gate, token)
+                                  ├─ internal/fsm (ops + gate_open(memberset))
+                                  ├─ reconcile (replica state machine)  ── pg_ctl / pg_rewind / restore_command
+                                  ├─ api: outer{/health,/peer/join*} + token{/peer/*}
+                                  └─ fencing goroutine ──► lease file ◄── fence bgworker (C)
+```
+Dispositions: gate race → accepted (W8 contract); PR CI → accepted (Distribution Plan); /peer/join routing → accepted (W10/D16); release workflow → accepted (W10).
+
+## Section 2: Code quality
+- `[P2] (confidence: 8/10) contrib/worlber_ha/agent/internal/agent/reconcile.go:319-499` — `reconcileReplica`, `followPrimary` and `walGone` together decide clone / rewind / follow / re-seed with nested time checks. W6 adds archive catch-up to these same branches. Refactor first, as an explicit replica state machine with no behaviour change (CEO T4), then add W6. Make change easy first.
+- `[P3] (confidence: 8/10) contrib/worlber_ha/agent/internal/fsm/fsm.go:313` — 1.2 already rejects unknown ops without changing state. The 1.3 change is to log at warn and return nil, so the leader's apply future does not report a false error. The plan matches this; the note is for accuracy.
+- Shared code: none worth extracting. The token checks in api.go and the planned join check have different contracts (cluster secret vs single-use nonce).
+Dispositions: refactor → accepted (CEO T4); unknown-op logging → accepted (W8).
+
+## Section 3: Test review
+Framework: Go `testing` (agent/go.mod), PostgreSQL TAP (t/001_cluster.pl), pg_regress (sql/worlber_ha.sql), docker lab (testing/lab.sh). Existing Go tests: internal/agent/failover_test.go (82 lines), internal/fsm/fsm_test.go (92 lines).
+
+```
+CODE PATHS                                         USER FLOWS
+[+] internal/safety (NEW, D1)                       [+] DBA: init → create_cluster
+  ├── [GAP→unit] RenewLease(role,epoch,quorumAt,      ├── [GAP→E2E] S11 join by token under load
+  │        sentAt,suspendedLocal,suspendedLeader,gap) ├── [GAP→TAP] reused / expired / non-admin token
+  ├── [GAP→unit] FenceDeadline(suspendAt,lastHB,      └── [GAP→TAP] --join-file / stdin
+  │        leaderSince,Q,ttl)                         [+] DBA: failover / switchover
+  ├── [★★ TESTED] PickCandidate basic — failover_test  ├── [GAP→E2E] S1, S1-19s, S2, S2b, S3, S4
+  │     └── [GAP→unit] LSN 0, stale actual_sync       └── [GAP→E2E] S5, S5b async_failover
+  ├── [GAP→unit] GateOpen(memberset) + new-op reject  [+] DBA: monitoring
+  ├── [GAP→unit] JoinToken validate/consume/retry     ├── [GAP→TAP] archive failing → health CRIT (D13)
+  ├── [GAP→unit] ArchiveCommand(dir) validate/quote   └── [GAP→TAP] fence_state / lease_age columns
+  └── [GAP→unit] Replica state transitions            [+] DBA: upgrade
+[+] fence.c bgworker                                  ├── [GAP→E2E] S9 rolling + pre-gate rollback (D15)
+  └── [GAP→TAP] stale / absent / future / boot_id     └── [GAP→E2E] S10 archive catch-up + throughput (D14)
+[+] ops: drill / proof / canary
+  └── [GAP→E2E] drill pass + abort; [GAP→TAP] non-admin denied
+[★★ TESTED] SyncNames ANY 1 — failover_test.go:46 → becomes FIRST 1 (update test, CRITICAL regression)
+
+COVERAGE today: 2/27 paths (7%) | after plan: 27/27 required
+```
+- **CRITICAL regression:** `failover_test.go:46,53` assert `ANY 1 (...)`. W3 changes this to `FIRST 1` after the gate only. Keep both cases: pre-gate stays `ANY 1`, post-gate becomes `FIRST 1` ordered by `actual_sync`. The existing contract carries forward (W8 says 1.2 behaviour is kept until the gate opens).
+- Flakiness: chaos runs use wait_until plus the 20-run matrix. Unit tests inject clocks (no sleeps).
+- Tests to retire: none.
+Dispositions: unit layer → accepted (D1 answer "Unit layer + chaos (recommended)"); TAP/E2E rows → carried from approved W2–W10 and D13–D16.
+
+## Section 4: Performance
+- `[P2] (confidence: 6/10)` W6 retention: Medium confidence, verify this is actually an issue. `pg_archivecleanup` on a gcsfuse/NFS directory holding 30 days of WAL can list 10^4–10^5 files (scale [estimated]: 16 MB segments at 50 MB/s ≈ 270k/day). Run it in its own goroutine every 10 min with a timeout, never in the 1s reconcile tick. This is implementation detail of approved W6.
+- `[P3] (confidence: 7/10)` D13's `pg_stat_archiver` check is one row per tick: negligible.
+- Listener `io.Copy` cost is measured in S7 (P7); no change.
+Dispositions: both accepted as implementation detail of W6/D13.
+
+## Outside Voice
+Codex CLI not installed; native fallback unavailable (no TaskOutput tool in this session). **Outside voice unavailable, no completed external review.**
+
+## TODOS.md
+No new TODOs. Existing: E2, scheduled drills, R3-8, softdog (contrib/worlber_ha/TODOS.md).
+
+## Decision ledger (eng)
+### R1: unit-test layer for safety logic
+Finding: Section 3, P1, confidence 9, internal/agent/failover_test.go (only 2 Go test files), reviewer: eng review
+Plan baseline: chaos scenarios S1–S11 + TAP as proof (CEO plan W1–W10)
+Runtime evidence: 2 Go test files, 174 lines total
+Comparison grid: | R1 | current: chaos only | A: internal/safety pure functions + table tests on each PR | B: chaos only |
+Question D1: Add a fast unit-test layer for the safety logic?
+Header: D1 tests
+Options:
+A) Unit layer + chaos (recommended)
+Table-driven Go unit tests for every safety decision function, run on each PR; chaos S1-S11 remain the end-to-end proof. Human ~2d / CC ~2h.
+B) Chaos scenarios only
+Keep the plan as is: system scenarios only, no new unit layer.
+State: approved
+Actual answer: A) Unit layer + chaos (recommended), D1 answer 2026-10-13
+Accepted scope: new package internal/safety with pure functions + table-driven tests listed in Section 3; run in worlber-ha-ci.yml on each PR.
+History: none
+
+Approval readiness: PASS. Checked R1 (D1) plus the CEO rows L0, L1, E1–E4, W10 and D13–D16 (answers cited in the CEO ledger). The required fixes (gate member set, PR CI, /peer/join routing, release workflow, retention goroutine) are necessary implementation of approved contracts.
+
+## Failure modes (eng)
+| Path | Failure | Test | Handling | Silent? |
+|---|---|---|---|---|
+| gate_open | 1.2 node added concurrently | unit GateOpen | apply rejects | no (event) |
+| /peer/join | flood from one IP | TAP | 429 + join_rejected | no |
+| archive cleanup | gcsfuse listing hangs | unit timeout | goroutine timeout + event | no |
+| PR change breaks RenewLease | split-brain window | unit (D1) on every PR | CI red | no |
+Critical gaps: 0.
+
+## Worktree parallelization
+| Step | Modules touched | Depends on |
+|---|---|---|
+| CI + release workflows | .github/workflows | — |
+| W1 ledger + chaos runner | agent/cmd/worlber-ledger, testing/chaos | — |
+| safety pkg + W2/W3 | agent/internal/{safety,agent,fsm}, fence.c | — |
+| W4–W6, W8 | agent/internal/{agent,fsm} | safety pkg + W2/W3 |
+| W10 packaging/init | packaging, agent/cmd | W10 /peer/join needs agent (after W6) |
+Lane A: CI/release workflows → W7 nightly. Lane B: W1 harness. Lane C: safety → W2 → W3 → W4 → W5 → W6 → W10 (agent part) → W8 (shared agent/fsm, sequential). Lane D: nfpm + `init` CLI skeleton (packaging, cmd).
+Execution order: launch A + B + C + D. Merge A and B first (harness proves S1/S2 fail). C continues sequentially; D merges with W10's agent part.
+Conflict flags: C and D both touch agent/cmd/worlber-ha-agent; D adds only a new init.go file.
+
+## Implementation Tasks (eng)
+- [ ] **E1 (P1, human ~1d / CC ~30min)** — CI — add worlber-ha-ci.yml (go vet/test, installcheck, TAP) on PRs. Surfaced by: Section 1 PR CI finding. Files: .github/workflows/worlber-ha-ci.yml. Verify: a PR run shows the job green; a broken test turns it red.
+- [ ] **E2 (P1, human ~2d / CC ~2h)** — safety — create internal/safety with RenewLease, FenceDeadline, CandidateEligible, GateOpen, JoinToken, ArchiveCommand, replica transitions + table tests. Surfaced by: D1. Files: contrib/worlber_ha/agent/internal/safety/. Verify: `go test ./internal/safety/...`.
+- [ ] **E3 (P1, human ~4h / CC ~20min)** — fsm — gate_open carries member set; apply rejects on mismatch. Surfaced by: Section 1 gate race. Files: internal/fsm/fsm.go. Verify: unit test with node added between check and commit.
+- [ ] **E4 (P1, human ~1h / CC ~10min)** — tests — split SyncNames tests into pre-gate ANY 1 and post-gate FIRST 1. Surfaced by: Section 3 CRITICAL regression. Files: internal/agent/failover_test.go. Verify: go test.
+- [ ] **E5 (P2, human ~4h / CC ~20min)** — release — worlber-ha-release.yml with nfpm deb/rpm + checksums. Surfaced by: Section 1 distribution. Files: .github/workflows/worlber-ha-release.yml, contrib/worlber_ha/packaging/nfpm.yaml. Verify: tag on a fork produces assets.
+- [ ] **E6 (P2, human ~2h / CC ~10min)** — api — register /peer/join on the outer mux with a RemoteAddr rate limit. Surfaced by: Section 1. Files: internal/agent/api.go. Verify: TAP join tests.
+- [ ] **E7 (P2, human ~2h / CC ~15min)** — archive — cleanup goroutine every 10 min with timeout. Surfaced by: Section 4. Files: internal/agent/archive.go. Verify: unit test with a slow fake lister.
+_No new tasks from Code quality beyond CEO T4._
+
+## Completion summary (eng)
+- Step 0: Scope Challenge — scope accepted as-is
+- Reality rows: 7/7 applicable rows emitted, 3 unverified premises
+- Architecture Review: 4 issues found
+- Code Quality Review: 2 issues found
+- Test Review: diagram produced, 25 gaps identified (all now required by approved work)
+- Performance Review: 2 issues found
+- NOT in scope: written (CEO section above)
+- What already exists: written (CEO section above)
+- TODOS.md updates: 0 items proposed to user
+- Failure modes: 0 critical gaps flagged
+- Unresolved decisions: 0 in this review
+- Outside voice: codex, unavailable (not installed)
+- Parallelization: 4 lanes, 3 parallel / 1 sequential
+- Lake Score: 1/1
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR | 5 proposals, 4 accepted, 1 deferred |
-| Outside Review | codex (auto) | Independent 2nd opinion | 0 | unavailable | codex not installed; no completed external review |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Outside Review | codex (auto, CEO + Eng) | Independent 2nd opinion | 2 | unavailable | codex not installed; no completed external review |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 33 issues, 0 critical gaps (all mapped to approved tasks) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **OUTSIDE COVERAGE:** codex, plan-review, unavailable (CLI not installed; native fallback unavailable). No completed external review.
-- **VERDICT:** CEO CLEARED — eng review required.
+- **OUTSIDE COVERAGE:** codex, plan-review (CEO and Eng phases), unavailable: CLI not installed, native fallback unavailable. No completed external review.
+- **VERDICT:** CEO CLEARED. Eng review complete with issues mapped to tasks (status issues_open means mapped work, not open decisions); ready to implement in the lane order above.
 
 NO UNRESOLVED DECISIONS
