@@ -94,6 +94,11 @@ ensure_lab() {
 
 restore() { # restore <node>: bring a faulted node back and wait for health
     local node=$1
+    # Only restart what the fault left broken: restarting a node that already
+    # recovered (S1: the agent restarts PostgreSQL) would be a second fault.
+    if healthy && dc exec -T "$node" pidof worlber-ha-agent >/dev/null 2>&1; then
+        return 0
+    fi
     log "restoring $node"
     dc restart "$node" >/dev/null
     if ! wait_until 240 healthy; then
@@ -102,16 +107,33 @@ restore() { # restore <node>: bring a faulted node back and wait for health
     fi
 }
 
-# fault_<scenario> <primary>: inject the fault, return immediately
+# fault_<scenario> <primary>: inject the fault and confirm it took effect;
+# a non-zero exit fails the run (a run whose fault never happened must
+# never count as a pass).
 fault_s1() {
-    dc exec -T "$1" bash -c 'kill -9 "$(head -1 /var/lib/postgresql/data/postmaster.pid)"'
+    local pid
+    pid=$(dc exec -T "$1" head -1 /var/lib/postgresql/data/postmaster.pid | tr -d '\r')
+    [ -n "$pid" ] || { echo "s1: no postmaster pid on $1" >&2; return 1; }
+    dc exec -T "$1" kill -9 "$pid"
+    dc exec -T "$1" bash -c "! kill -0 $pid 2>/dev/null" || { echo "s1: postmaster $pid still alive" >&2; return 1; }
 }
 fault_s2() {
-    if [ "$(dc exec -T "$1" printenv CHAOS_KEEP_PG 2>/dev/null)" != "1" ]; then
+    local pids
+    if [ "$(dc exec -T "$1" printenv CHAOS_KEEP_PG 2>/dev/null | tr -d '\r')" != "1" ]; then
         echo "s2 needs the lab started with CHAOS_KEEP_PG=1 (CHAOS_KEEP_PG=1 ./lab.sh up)" >&2
-        exit 2
+        return 1
     fi
-    dc exec -T "$1" pkill -9 -x worlber-ha-agent
+    # pkill -x matches only the first 15 characters of the name: use pidof.
+    pids=$(dc exec -T "$1" pidof worlber-ha-agent | tr -d '\r')
+    [ -n "$pids" ] || { echo "s2: no agent process on $1" >&2; return 1; }
+    # shellcheck disable=SC2086
+    dc exec -T "$1" kill -9 $pids
+    sleep 1
+    if dc exec -T "$1" pidof worlber-ha-agent >/dev/null 2>&1; then
+        echo "s2: agent still running on $1" >&2; return 1
+    fi
+    dc exec -T -u postgres "$1" pg_ctl -D /var/lib/postgresql/data status >/dev/null ||
+        { echo "s2: PostgreSQL on $1 is not running (the scenario needs it up)" >&2; return 1; }
 }
 
 run_one() { # run_one <scenario> <n> <stamp>
@@ -142,7 +164,15 @@ run_one() { # run_one <scenario> <n> <stamp>
         sleep "$WARMUP"
         fault_at=$(now_ms)
         log "$sc run $n: fault on $p"
-        "fault_$sc" "$p"
+        if ! "fault_$sc" "$p"; then
+            log "$sc run $n: FAULT NOT INJECTED, run fails"
+            kill "$writer" 2>/dev/null || true
+            wait "$writer" || true
+            jq -n --arg sc "$sc" --argjson n "$n" --arg old "$p" \
+                '{scenario: $sc, run: $n, old_primary: $old, pass: false, error: "fault not injected"}' >"$base.json"
+            restore "$p"
+            return 1
+        fi
     fi
     wait "$writer" || true
     [ -n "$reporter" ] && { wait "$reporter" || true; }
