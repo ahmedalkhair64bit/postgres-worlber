@@ -114,6 +114,7 @@ CHAOS_SOAK=30m ./chaos/run.sh s7        # no fault: false failovers, report canc
 | s2b | network partition of the primary **and** `SIGSTOP` a backend so fast shutdown hangs | 0 acked rows missing; every postgres process of the old primary gone (the agent escalates to SIGKILL) |
 | s3 | `docker pause` the whole primary node until the run ends | 0 acked rows missing (the lease clock keeps running while paused) |
 | s4 | network partition of the primary until the run ends | 0 acked rows missing |
+| s5 | kill the synchronous standby, then the primary (two of three nodes gone) | no promotion (no Raft majority), 0 acked rows missing, cluster recovers when a node returns |
 | s7 | none, for `CHAOS_SOAK`; long reports on port 5001 | 0 acked rows missing, 0 automatic failovers |
 
 Each run writes `chaos/results/<scenario>-<stamp>-<n>.json`. It holds the
