@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -367,4 +369,31 @@ func reportOnce(ctx context.Context, o ReportOptions, id int) ReportRecord {
 		err = fmt.Errorf("run ended: %w", err)
 	}
 	return done(err)
+}
+
+// ReadKeysFile reads "client,seq" lines (COPY ... TO STDOUT WITH CSV) taken
+// from a database the harness cannot reach over TCP, e.g. a fenced old
+// primary started in isolation.
+func ReadKeysFile(path string) (map[Key]bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	out := map[Key]bool{}
+	sc := bufio.NewScanner(f)
+	line := 0
+	for sc.Scan() {
+		line++
+		t := strings.TrimSpace(sc.Text())
+		if t == "" {
+			continue
+		}
+		var k Key
+		if _, err := fmt.Sscanf(t, "%d,%d", &k.Client, &k.Seq); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", path, line, err)
+		}
+		out[k] = true
+	}
+	return out, sc.Err()
 }

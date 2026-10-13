@@ -4,7 +4,7 @@
 //	worlber-ledger setup  --dsn DSN [--reset]
 //	worlber-ledger write  --dsn RW_DSN --clients 16 --rate 50 --duration 5m --out run.ledger
 //	worlber-ledger report --dsn RO_DSN --sessions 2 --duration 5m --out run.reports
-//	worlber-ledger verify --ledger run.ledger --dsn NEW_PRIMARY [--old-dsn OLD_COPY] [--fault-at MS]
+//	worlber-ledger verify --ledger run.ledger --dsn NEW_PRIMARY [--old-dsn OLD_COPY | --old-keys FILE] [--fault-at MS]
 //
 // "verify" prints a JSON verdict and exits 1 when an acknowledged row is
 // missing, an acknowledged row exists only on the old primary, or a row the
@@ -121,6 +121,7 @@ func cmdVerify(ctx context.Context, args []string) error {
 	path := fs.String("ledger", "", "ledger file written by 'write'")
 	dsn := fs.String("dsn", "", "connection string of the new primary")
 	oldDSN := fs.String("old-dsn", "", "optional: isolated, read-only copy of the old primary")
+	oldKeys := fs.String("old-keys", "", "optional: file of client,seq rows dumped from the old primary")
 	faultAt := fs.Int64("fault-at", 0, "fault injection time, unix ms (enables RTO)")
 	fs.Parse(args)
 	recs, err := ledger.Read(*path)
@@ -132,9 +133,14 @@ func cmdVerify(ctx context.Context, args []string) error {
 		return fmt.Errorf("new primary: %w", err)
 	}
 	var oldRows map[ledger.Key]bool
-	if *oldDSN != "" {
+	switch {
+	case *oldDSN != "":
 		if oldRows, err = ledger.ReadKeys(ctx, *oldDSN); err != nil {
 			return fmt.Errorf("old primary copy: %w", err)
+		}
+	case *oldKeys != "":
+		if oldRows, err = ledger.ReadKeysFile(*oldKeys); err != nil {
+			return fmt.Errorf("old primary keys: %w", err)
 		}
 	}
 	res := verifyResult{Verdict: ledger.Verify(recs, newRows, oldRows), Summary: ledger.Summarize(recs, *faultAt)}

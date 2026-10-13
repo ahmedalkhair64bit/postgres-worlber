@@ -109,7 +109,7 @@ CHAOS_SOAK=30m ./chaos/run.sh s7        # no fault: false failovers, report canc
 | Scenario | Fault | Pass |
 |---|---|---|
 | s1 | `kill -9` of the postmaster on the primary; its agent stays alive | 0 acked rows missing, RTO ≤ `CHAOS_RTO_MAX` (30s) |
-| s2 | `kill -9` of the agent on the primary; PostgreSQL keeps running (like systemd `KillMode=process`) | 0 acked rows missing, 0 acked rows only on the old primary, RTO ≤ 30s |
+| s2 | `kill -9` of the agent on the primary; PostgreSQL keeps running (like systemd `KillMode=process`) | 0 acked rows missing, 0 acked rows only on the old primary, RTO ≤ 30s. The fence worker should stop the old primary. If it did, the harness starts the old data in isolation to compare its rows: Unix socket only, read-only, `worlber_ha.fence=off`. The verdict records `old_primary_state` |
 | s7 | none, for `CHAOS_SOAK`; long reports on port 5001 | 0 acked rows missing, 0 automatic failovers |
 
 Each run writes `chaos/results/<scenario>-<stamp>-<n>.json`. It holds the

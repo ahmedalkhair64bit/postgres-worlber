@@ -136,8 +136,21 @@ fault_s2() {
         { echo "s2: PostgreSQL on $1 is not running (the scenario needs it up)" >&2; return 1; }
 }
 
+# dump_old_keys <node> <file>: read the ledger keys of a stopped old primary
+# without letting it serve anything.
+dump_old_keys() {
+    local node=$1 out=$2 data=/var/lib/postgresql/data
+    dc exec -T -u postgres "$node" pg_ctl -D "$data" -w -t 60 -l /tmp/isolated.log start \
+        -o "-c listen_addresses='' -c port=5499 -c unix_socket_directories=/tmp -c worlber_ha.fence=off -c default_transaction_read_only=on -c archive_mode=off" >/dev/null || return 1
+    dc exec -T -u postgres "$node" psql -X -qAt -h /tmp -p 5499 -d postgres \
+        -c "COPY (SELECT client, seq FROM worlber_ledger) TO STDOUT WITH CSV" >"$out"
+    local rc=$?
+    dc exec -T -u postgres "$node" pg_ctl -D "$data" -w -m fast stop >/dev/null || true
+    return $rc
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
-    local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify old_dsn="" newp failovers events pass
+    local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
     ensure_lab
     p=$(primary)
@@ -178,14 +191,27 @@ run_one() { # run_one <scenario> <n> <stamp>
     [ -n "$reporter" ] && { wait "$reporter" || true; }
 
     newp=$(primary)
-    # S2: the old primary's PostgreSQL is still running without its agent.
-    # Rows on it that are not on the new primary must never be acknowledged.
+    # S2: rows on the old primary that are not on the new primary must never
+    # be acknowledged.  If fencing already stopped the old primary, start
+    # its data in isolation (unix socket only, read-only, fence off, no
+    # agent: it died in S2) and dump the ledger keys.
+    local old_args=() old_state=""
     if [ "$sc" = s2 ] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
-        old_dsn="host=${IP[$p]} port=5432 connect_timeout=2 $AUTH"
+        if dc exec -T -u postgres "$p" pg_ctl -D /var/lib/postgresql/data status >/dev/null 2>&1; then
+            old_state="running (not fenced)"
+            old_args=(--old-dsn "host=${IP[$p]} port=5432 connect_timeout=2 $AUTH")
+        else
+            old_state="stopped (fenced)"
+            if dump_old_keys "$p" "$base.oldkeys"; then
+                old_args=(--old-keys "$base.oldkeys")
+            else
+                old_state="stopped (fenced); isolated start failed"
+            fi
+        fi
     fi
     if [ -n "$newp" ]; then
         verify=$("$LEDGER" verify --ledger "$base.ledger" --dsn "host=${IP[$newp]} port=5432 connect_timeout=2 $AUTH" \
-            ${old_dsn:+--old-dsn "$old_dsn"} --fault-at "$fault_at" || true)
+            "${old_args[@]}" --fault-at "$fault_at" || true)
     fi
     [ -n "${verify:-}" ] || verify='{"pass":false,"error":"no primary to verify against"}'
     events=$(anysql "SELECT coalesce(json_agg(json_build_object('time', event_time, 'kind', kind, 'node', node, 'detail', detail) ORDER BY seq DESC), '[]') FROM worlber_ha.events WHERE event_time >= to_timestamp($start_s)" || echo '[]')
@@ -200,12 +226,12 @@ run_one() { # run_one <scenario> <n> <stamp>
     jq -n --arg sc "$sc" --argjson n "$n" --arg old "$p" --arg new "${newp:-}" \
         --argjson fault_at "$fault_at" --argjson clients "$CLIENTS" --argjson rate "$RATE" \
         --argjson v "$verify" --argjson ev "$events" --argjson fo "$failovers" \
-        --argjson reports "$reports" --argjson pass "$pass" --arg old_checked "${old_dsn:+yes}" \
+        --argjson reports "$reports" --argjson pass "$pass" --arg old_checked "${old_args[*]:+yes}" --arg old_state "$old_state" \
         '{scenario: $sc, run: $n, old_primary: $old, new_primary: $new, fault_at_ms: $fault_at,
           clients: $clients, rate_per_client: $rate, automatic_failovers: $fo,
-          old_primary_checked: ($old_checked == "yes"), verdict: $v, reports: $reports,
+          old_primary_checked: ($old_checked == "yes"), old_primary_state: $old_state, verdict: $v, reports: $reports,
           events: $ev, pass: $pass}' >"$base.json"
-    log "$sc run $n: pass=$pass old=$p new=${newp:-none} rto_ms=$(jq '.summary.rto_ms // null' <<<"$verify") acked=$(jq '.acked // 0' <<<"$verify") missing=$(jq '.acked_missing // null' <<<"$verify") old_only_acked=$(jq '.old_only_acked // null' <<<"$verify") failovers=$failovers"
+    log "$sc run $n: pass=$pass old=$p new=${newp:-none} rto_ms=$(jq '.summary.rto_ms // null' <<<"$verify") acked=$(jq '.acked // 0' <<<"$verify") missing=$(jq '.acked_missing // null' <<<"$verify") old_only_acked=$(jq '.old_only_acked // null' <<<"$verify") failovers=$failovers${old_state:+ old_primary=$old_state}"
     [ "$sc" = s7 ] || restore "$p"
     [ "$pass" = true ]
 }

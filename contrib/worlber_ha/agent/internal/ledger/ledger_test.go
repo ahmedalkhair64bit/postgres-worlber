@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -162,5 +163,22 @@ func TestPercentile(t *testing.T) {
 	s := Summarize([]Record{{Client: 1, Seq: 1, Out: Ack, Start: 10, End: 13}, {Client: 1, Seq: 2, Out: Failed, Start: 0, End: 900}}, 0)
 	if s.AckP50MS != 3 || s.AckP99MS != 3 {
 		t.Fatalf("latency must use acks only: %+v", s)
+	}
+}
+
+func TestReadKeysFile(t *testing.T) {
+	p := t.TempDir() + "/keys.csv"
+	if err := os.WriteFile(p, []byte("1,5\n2,7\n\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	k, err := ReadKeysFile(p)
+	if err != nil || len(k) != 2 || !k[Key{1, 5}] || !k[Key{2, 7}] {
+		t.Fatalf("%v %v", k, err)
+	}
+	if err := os.WriteFile(p, []byte("x,y\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadKeysFile(p); err == nil {
+		t.Fatal("bad line accepted")
 	}
 }
