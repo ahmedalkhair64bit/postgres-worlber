@@ -12,6 +12,7 @@
 #   s2b  partition + SIGSTOP a backend so fast shutdown hangs (agent SIGKILLs)
 #   s1late  kill the postmaster and freeze the agent ~19s (CHAOS_LATE) so it
 #           cannot restart PostgreSQL near the failover deadline
+#   s5   kill the sync standby, then the primary; must block (async_failover never)
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
 #
 # Every run writes results/<scenario>-<stamp>-<n>.json with the ledger verdict
@@ -200,6 +201,28 @@ fault_s1late() {
     dc exec -T "$1" bash -c "! kill -0 $pid 2>/dev/null"
 }
 
+# sync_standby: the node the primary currently treats as synchronous.
+sync_standby() { anysql "SELECT node FROM worlber_ha.cluster_status WHERE role='replica' AND sync_state IN ('sync','quorum') LIMIT 1" || true; }
+
+# s5: kill the synchronous standby, then kill the primary CHAOS_S5_GAP s
+# later.  With async_failover=never the cluster must NOT auto-promote the
+# remaining async standby (that would lose the commits the dead sync standby
+# had but it did not).  Pass = a failover_blocked event and no automatic
+# failover; the harness then forces a failover to recover.
+fault_s5() {
+    local ss pid
+    ss=$(sync_standby)
+    [ -n "$ss" ] && [ "$ss" != "$1" ] || { echo "s5: no sync standby" >&2; return 1; }
+    log "s5: killing sync standby $ss"
+    dc kill "$ss" >/dev/null || return 1
+    S5_SYNC_STANDBY=$ss
+    sleep "${CHAOS_S5_GAP:-5}"
+    pid=$(dc exec -T "$1" head -1 /var/lib/postgresql/data/postmaster.pid | tr -d '\r')
+    [ -n "$pid" ] || { echo "s5: no postmaster on $1" >&2; return 1; }
+    dc exec -T "$1" kill -9 "$pid" || return 1
+    dc exec -T "$1" bash -c "! kill -0 $pid 2>/dev/null"
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
     local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
@@ -283,8 +306,11 @@ run_one() { # run_one <scenario> <n> <stamp>
     local reports='null'
     [ -f "$base.reports" ] && reports=$(jq -s 'group_by(.o) | map({(.[0].o): length}) | add // {}' "$base.reports")
 
-    pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" '
+    local blocked=0
+    blocked=$(jq '[.[] | select(.kind == "failover_blocked")] | length' <<<"$events")
+    pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" --argjson blk "$blocked" '
         if $sc == "s7" then ($v.pass == true and $fo == 0)
+        elif $sc == "s5" then ($fo == 0 and $blk > 0)
         else ($v.pass == true and ($v.summary.rto_ms // -1) >= 0 and ($v.summary.rto_ms // -1) <= $max)
         end')
     jq -n --arg sc "$sc" --argjson n "$n" --arg old "$p" --arg new "${newp:-}" \
@@ -305,13 +331,20 @@ run_one() { # run_one <scenario> <n> <stamp>
             pass=false
         fi
     fi
+    if [ "$sc" = s5 ]; then
+        # recover: bring the killed sync standby back, then force a failover
+        # off the dead primary so the lab is usable for the next run.
+        [ -n "${S5_SYNC_STANDBY:-}" ] && dc start "$S5_SYNC_STANDBY" >/dev/null 2>&1 || true
+        wait_until 60 "a live standby to force onto" sync_standby || true
+        anysql "SELECT worlber_ha.failover(force => true)" >/dev/null 2>&1 || true
+    fi
     [ "$sc" = s7 ] || restore "$p"
     [ "$pass" = true ]
 }
 
 sc=${1:-}
 runs=${2:-1}
-case "$sc" in s1|s1late|s2|s2b|s3|s4|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "$sc" in s1|s1late|s2|s2b|s3|s4|s5|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)
 failed=0

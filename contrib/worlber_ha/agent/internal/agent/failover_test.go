@@ -11,25 +11,42 @@ func TestPickCandidate(t *testing.T) {
 	ok := func(name string, sync bool, lsn uint64) Candidate {
 		return Candidate{Name: name, Sync: sync, Fresh: true, Running: true, InRecovery: true, LSN: lsn}
 	}
+	actual := func(c Candidate) Candidate { c.InActualSync = true; return c }
 	cases := []struct {
-		name    string
-		cands   []Candidate
-		primary uint64
-		maxLag  uint64
-		strict  bool
-		want    string
+		name string
+		cand []Candidate
+		opts PickOptions
+		want string
 	}{
-		{"prefers sync", []Candidate{ok("b", false, 200), ok("a", true, 100)}, 200, 0, false, "a"},
-		{"highest lsn", []Candidate{ok("b", false, 100), ok("c", false, 300)}, 300, 0, false, "c"},
-		{"tie by name", []Candidate{ok("c", false, 100), ok("b", false, 100)}, 100, 0, false, "b"},
-		{"lag filter", []Candidate{ok("b", false, 100)}, 1000, 500, false, ""},
-		{"strict needs sync", []Candidate{ok("b", false, 100)}, 100, 0, true, ""},
-		{"skip unreachable", []Candidate{{Name: "x", Sync: true}, ok("y", false, 1)}, 1, 0, false, "y"},
-		{"skip primary-like", []Candidate{{Name: "x", Fresh: true, Running: true}}, 1, 0, false, ""},
-		{"none", nil, 0, 0, false, ""},
+		// Manual / switchover selection (Automatic=false): any eligible node.
+		{"prefers sync", []Candidate{ok("b", false, 200), ok("a", true, 100)}, PickOptions{PrimaryLSN: 200}, "a"},
+		{"highest lsn", []Candidate{ok("b", false, 100), ok("c", false, 300)}, PickOptions{PrimaryLSN: 300}, "c"},
+		{"tie by name", []Candidate{ok("c", false, 100), ok("b", false, 100)}, PickOptions{PrimaryLSN: 100}, "b"},
+		{"lag filter", []Candidate{ok("b", false, 100)}, PickOptions{PrimaryLSN: 1000, MaxLag: 500}, ""},
+		{"strict needs sync", []Candidate{ok("b", false, 100)}, PickOptions{PrimaryLSN: 100, Strict: true}, ""},
+		{"skip unreachable", []Candidate{{Name: "x", Sync: true}, ok("y", false, 1)}, PickOptions{PrimaryLSN: 1}, "y"},
+		{"skip primary-like", []Candidate{{Name: "x", Fresh: true, Running: true}}, PickOptions{PrimaryLSN: 1}, ""},
+		{"none", nil, PickOptions{}, ""},
+
+		// Automatic failover must promote only the actual synchronous standby.
+		{"auto promotes the actual sync node even with less WAL",
+			[]Candidate{actual(ok("a", true, 100)), ok("b", false, 300)},
+			PickOptions{PrimaryLSN: 300, Automatic: true, HasActualSync: true}, "a"},
+		{"auto blocks when the only sync standby is down (async_failover never)",
+			[]Candidate{ok("b", false, 300)},
+			PickOptions{PrimaryLSN: 300, Automatic: true, HasActualSync: true, Async: "never"}, ""},
+		{"auto within_lag promotes the best async standby when the sync one is down",
+			[]Candidate{ok("b", false, 300)},
+			PickOptions{PrimaryLSN: 300, Automatic: true, HasActualSync: true, Async: "within_lag"}, "b"},
+		{"auto blocks when no sync standby was ever tracked (never)",
+			[]Candidate{ok("b", false, 300)},
+			PickOptions{PrimaryLSN: 300, Automatic: true, HasActualSync: false, Async: "never"}, ""},
+		{"auto picks the most advanced actual sync node",
+			[]Candidate{actual(ok("a", true, 100)), actual(ok("c", true, 250))},
+			PickOptions{PrimaryLSN: 250, Automatic: true, HasActualSync: true}, "c"},
 	}
 	for _, c := range cases {
-		got, why := PickCandidate(c.cands, c.primary, c.maxLag, c.strict)
+		got, why := PickCandidate(c.cand, c.opts)
 		if got != c.want {
 			t.Errorf("%s: got %q (%s), want %q", c.name, got, why, c.want)
 		}

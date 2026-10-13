@@ -467,6 +467,10 @@ func (a *Agent) candidates(st fsm.State) []Candidate {
 	// flag is only a preference and may name the primary itself.  Without a
 	// report from the running primary (new leader), fall back to the flag.
 	seen, known := a.lastSync(st.Primary, st.Epoch)
+	inActual := map[string]bool{}
+	for _, n := range st.ActualSync {
+		inActual[n] = true
+	}
 	for _, n := range st.SortedNodes() {
 		if n.Name == st.Primary || n.Witness {
 			continue
@@ -476,7 +480,7 @@ func (a *Agent) candidates(st fsm.State) []Candidate {
 		if known {
 			sync = seen[n.Name]
 		}
-		out = append(out, Candidate{Name: n.Name, Sync: sync, Fresh: fresh,
+		out = append(out, Candidate{Name: n.Name, Sync: sync, InActualSync: inActual[n.Name], Fresh: fresh,
 			Running: hb.Health.Running, InRecovery: hb.Health.InRecovery, LSN: hb.Health.LSN})
 	}
 	return out
@@ -496,9 +500,8 @@ func (a *Agent) switchover(ctx context.Context, target string) (opResult, error)
 		return opResult{}, errHint("Run SELECT worlber_ha.resume() first.", "cluster is paused")
 	}
 	if target == "" {
-		maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
 		phb, _ := a.beat(st.Primary)
-		name, why := PickCandidate(a.candidates(st), phb.Health.LSN, maxLag, false)
+		name, why := PickCandidate(a.candidates(st), a.pickOptions(st, phb.Health.LSN, false))
 		if name == "" {
 			return opResult{}, fmt.Errorf("no switchover candidate: %s", why)
 		}
@@ -614,12 +617,12 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 			"primary %q is healthy", st.Primary)
 	}
 	if target == "" {
-		maxLag := uint64(0)
-		if !force {
-			maxLag, _ = fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
-		}
 		phb, _ := a.beat(st.Primary)
-		name, why := PickCandidate(a.candidates(st), phb.Health.LSN, maxLag, false)
+		opts := a.pickOptions(st, phb.Health.LSN, false)
+		if force {
+			opts.MaxLag = 0
+		}
+		name, why := PickCandidate(a.candidates(st), opts)
 		if name == "" {
 			return opResult{}, fmt.Errorf("no failover candidate: %s", why)
 		}
@@ -947,4 +950,17 @@ func validateNewOption(key, value string) error {
 		}
 	}
 	return nil
+}
+
+// pickOptions builds the failover selection options from the cluster state.
+func (a *Agent) pickOptions(st fsm.State, primaryLSN uint64, automatic bool) PickOptions {
+	maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
+	return PickOptions{
+		PrimaryLSN:    primaryLSN,
+		MaxLag:        maxLag,
+		Strict:        st.Option("synchronous_mode") == "strict",
+		Automatic:     automatic,
+		HasActualSync: len(st.ActualSync) > 0,
+		Async:         st.Option("async_failover"),
+	}
 }

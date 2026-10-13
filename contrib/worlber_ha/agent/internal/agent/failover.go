@@ -11,18 +11,30 @@ import (
 
 // Candidate is a standby considered for promotion.
 type Candidate struct {
-	Name       string
-	Sync       bool
-	Fresh      bool
-	Running    bool
-	InRecovery bool
-	LSN        uint64
+	Name         string
+	Sync         bool // configured as synchronous (the sync flag)
+	InActualSync bool // the primary last reported it as actually synchronous
+	Fresh        bool
+	Running      bool
+	InRecovery   bool
+	LSN          uint64
 }
 
-// PickCandidate chooses the standby to promote.  Synchronous standbys are
-// preferred, then the one with the most WAL received.  maxLag (bytes behind
-// primaryLSN) of 0 disables the lag check; strict allows only sync standbys.
-func PickCandidate(cands []Candidate, primaryLSN, maxLag uint64, strict bool) (string, string) {
+// PickOptions controls PickCandidate.
+type PickOptions struct {
+	PrimaryLSN uint64
+	MaxLag     uint64 // 0 disables the lag check
+	Strict     bool   // only configured-sync standbys are eligible
+	// Automatic failover must not lose acknowledged data: it promotes a
+	// standby only from the actual synchronous set, unless HasActualSync is
+	// false (no sync standby was tracked) or Async is "within_lag".
+	Automatic     bool
+	HasActualSync bool
+	Async         string // "never" (default) or "within_lag"
+}
+
+// PickCandidate chooses the standby to promote and, on failure, explains why.
+func PickCandidate(cands []Candidate, opts PickOptions) (string, string) {
 	var ok []Candidate
 	reasons := ""
 	for _, c := range cands {
@@ -33,13 +45,33 @@ func PickCandidate(cands []Candidate, primaryLSN, maxLag uint64, strict bool) (s
 			reasons += c.Name + ": not running; "
 		case !c.InRecovery:
 			reasons += c.Name + ": not a standby; "
-		case strict && !c.Sync:
+		case opts.Strict && !c.Sync:
 			reasons += c.Name + ": not synchronous (strict mode); "
-		case maxLag > 0 && primaryLSN > c.LSN && primaryLSN-c.LSN > maxLag:
-			reasons += fmt.Sprintf("%s: lag %d bytes exceeds maximum_lag_on_failover; ", c.Name, primaryLSN-c.LSN)
+		case opts.MaxLag > 0 && opts.PrimaryLSN > c.LSN && opts.PrimaryLSN-c.LSN > opts.MaxLag:
+			reasons += fmt.Sprintf("%s: lag %d bytes exceeds maximum_lag_on_failover; ", c.Name, opts.PrimaryLSN-c.LSN)
 		default:
 			ok = append(ok, c)
 		}
+	}
+	// Automatic failover prefers the actual synchronous standbys, which are
+	// guaranteed to hold every acknowledged commit.
+	if opts.Automatic {
+		var sync []Candidate
+		for _, c := range ok {
+			if c.InActualSync {
+				sync = append(sync, c)
+			}
+		}
+		if len(sync) > 0 {
+			ok = sync
+		} else if opts.HasActualSync && opts.Async != "within_lag" {
+			return "", "the synchronous standby is not available; " + eligibleNote(ok) +
+				"run SELECT worlber_ha.failover(force => true) to promote another node and accept data loss (async_failover is 'never')"
+		} else if !opts.HasActualSync && opts.Async != "within_lag" {
+			return "", "no synchronous standby was tracked, so promoting any node may lose data; " +
+				"run SELECT worlber_ha.failover(force => true), or set async_failover = 'within_lag'"
+		}
+		// within_lag: fall through with the lag-filtered set
 	}
 	if len(ok) == 0 {
 		if reasons == "" {
@@ -48,6 +80,9 @@ func PickCandidate(cands []Candidate, primaryLSN, maxLag uint64, strict bool) (s
 		return "", reasons
 	}
 	sort.Slice(ok, func(i, j int) bool {
+		if ok[i].InActualSync != ok[j].InActualSync {
+			return ok[i].InActualSync
+		}
 		if ok[i].Sync != ok[j].Sync {
 			return ok[i].Sync
 		}
@@ -57,6 +92,13 @@ func PickCandidate(cands []Candidate, primaryLSN, maxLag uint64, strict bool) (s
 		return ok[i].Name < ok[j].Name
 	})
 	return ok[0].Name, ""
+}
+
+func eligibleNote(ok []Candidate) string {
+	if len(ok) == 0 {
+		return "no other standby is reachable either; "
+	}
+	return ""
 }
 
 // leaderLoop watches the primary and fails over when it stays unhealthy
@@ -100,7 +142,44 @@ func (a *Agent) leaderLoop(ctx context.Context) {
 			a.readyTerm = term
 			a.mu.Unlock()
 		}
+		a.reconcileActualSync()
 		a.checkPrimary()
+	}
+}
+
+// reconcileActualSync commits the set of standbys the running primary reports
+// as synchronous, so a later leader knows which nodes hold every
+// acknowledged commit.  It runs on the leader only.
+func (a *Agent) reconcileActualSync() {
+	st := a.fsm.Get()
+	if !st.Bootstrapped() || st.Paused() {
+		return
+	}
+	seen, known := a.lastSync(st.Primary, st.Epoch)
+	if !known {
+		return // no running-primary report this epoch yet; keep the committed set
+	}
+	cur := map[string]bool{}
+	for _, n := range st.ActualSync {
+		cur[n] = true
+	}
+	same := len(cur) == len(seen)
+	for n := range seen {
+		if !cur[n] {
+			same = false
+		}
+	}
+	if same {
+		return
+	}
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	if err := a.apply(fsm.Command{Op: "actual_sync", SyncNodes: names,
+		Detail: fmt.Sprintf("synchronous standbys: %v", names)}); err != nil {
+		a.log.Warn("cannot commit actual_sync", "error", err)
 	}
 }
 
@@ -153,8 +232,8 @@ func (a *Agent) checkPrimary() {
 	st = a.fsm.Get()
 
 	maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
-	strict := st.Option("synchronous_mode") == "strict"
-	name, why := PickCandidate(a.candidates(st), hb.Health.LSN, maxLag, strict)
+	name, why := PickCandidate(a.candidates(st), a.pickOptions(st, hb.Health.LSN, true))
+	_ = maxLag
 	if name == "" {
 		a.mu.Lock()
 		if time.Since(a.lastNoCand) > 60*time.Second {

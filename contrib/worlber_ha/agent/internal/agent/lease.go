@@ -80,8 +80,7 @@ func (a *Agent) confirmFor(hb heartbeat) bool {
 	canReplace := !st.Paused()
 	if canReplace {
 		phb, _ := a.beat(st.Primary)
-		maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
-		name, _ := PickCandidate(a.candidates(st), phb.Health.LSN, maxLag, st.Option("synchronous_mode") == "strict")
+		name, _ := PickCandidate(a.candidates(st), a.pickOptions(st, phb.Health.LSN, true))
 		canReplace = name != ""
 	}
 	a.mu.Lock()

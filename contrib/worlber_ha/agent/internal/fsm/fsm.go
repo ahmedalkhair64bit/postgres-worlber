@@ -12,6 +12,7 @@ import (
 	"io"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ const (
 // Cluster options and their defaults.
 var DefaultConfig = map[string]string{
 	"failover_timeout":        "30s",
+	"async_failover":          "never",
 	"maximum_lag_on_failover": "16MB",
 	"synchronous_mode":        "available", // available | strict
 	"paused":                  "false",
@@ -75,6 +77,12 @@ type State struct {
 	Nodes        map[string]*Node  `json:"nodes"`
 	Config       map[string]string `json:"config"`
 	Events       []Event           `json:"events"`
+	// ActualSync is the set of standbys the running primary last reported as
+	// synchronous (sync_state sync/quorum).  It is the only set that is
+	// guaranteed to hold every acknowledged commit, so automatic failover
+	// promotes from it.  Committed by the leader as it changes, so a new
+	// leader still knows it.
+	ActualSync []string `json:"actual_sync,omitempty"`
 }
 
 // Command is a state change committed through Raft.
@@ -96,6 +104,9 @@ type Command struct {
 
 	// set_sync
 	Sync bool `json:"sync,omitempty"`
+
+	// actual_sync
+	SyncNodes []string `json:"sync_nodes,omitempty"`
 
 	// event
 	Kind   string `json:"kind,omitempty"`
@@ -310,6 +321,15 @@ func (s *State) apply(c Command) error {
 		}
 		s.event(c.Time, c.Kind, c.Name, c.Detail)
 
+	case "actual_sync":
+		for _, n := range c.SyncNodes {
+			if _, ok := s.Nodes[n]; !ok {
+				return fmt.Errorf("actual_sync names unknown node %q", n)
+			}
+		}
+		s.ActualSync = append([]string(nil), c.SyncNodes...)
+		s.event(c.Time, "actual_sync", "", strings.Join(c.SyncNodes, ", "))
+
 	default:
 		return fmt.Errorf("unknown op %q", c.Op)
 	}
@@ -334,6 +354,10 @@ func ValidateOption(key, value string) error {
 	case "maximum_lag_on_failover":
 		if _, err := ParseBytes(value); err != nil {
 			return err
+		}
+	case "async_failover":
+		if value != "never" && value != "within_lag" {
+			return fmt.Errorf("async_failover must be 'never' or 'within_lag'")
 		}
 	case "synchronous_mode":
 		if value != "available" && value != "strict" {
