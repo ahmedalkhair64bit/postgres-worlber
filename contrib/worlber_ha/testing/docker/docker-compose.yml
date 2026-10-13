@@ -22,6 +22,8 @@ x-node: &node
     POSTGRES_PASSWORD: postgres
     VIP: 172.28.0.100/24
     VIP_INTERFACE: eth0
+    # chaos S2: keep PostgreSQL running when the agent dies (see entrypoint.sh)
+    CHAOS_KEEP_PG: ${CHAOS_KEEP_PG:-0}
   cap_add: [NET_ADMIN, NET_RAW]
   restart: unless-stopped
   stop_grace_period: 30s

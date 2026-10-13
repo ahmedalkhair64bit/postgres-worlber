@@ -64,6 +64,13 @@ agent=$!
 trap 'kill -TERM $agent 2>/dev/null' TERM INT
 wait $agent || true
 wait $agent 2>/dev/null || true
+if [ "${CHAOS_KEEP_PG:-0}" = "1" ]; then
+    # Chaos scenario S2: behave like production systemd (KillMode=process)
+    # with an agent that does not come back: PostgreSQL keeps running.
+    echo "entrypoint: agent ended; CHAOS_KEEP_PG=1 keeps PostgreSQL running"
+    trap 'exit 0' TERM INT
+    while :; do sleep 1; done
+fi
 if as_pg pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
     echo "entrypoint: agent ended, stopping PostgreSQL"
     as_pg pg_ctl -D "$PGDATA" stop -m fast -w -t 25 || true

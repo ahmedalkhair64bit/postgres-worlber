@@ -150,3 +150,17 @@ func TestReportOutcome(t *testing.T) {
 		t.Fatal(o)
 	}
 }
+
+func TestPercentile(t *testing.T) {
+	v := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if percentile(v, 50) != 5 || percentile(v, 99) != 10 || percentile(v, 1) != 1 {
+		t.Fatal(percentile(v, 50), percentile(v, 99))
+	}
+	if percentile(nil, 50) != 0 {
+		t.Fatal("empty")
+	}
+	s := Summarize([]Record{{Client: 1, Seq: 1, Out: Ack, Start: 10, End: 13}, {Client: 1, Seq: 2, Out: Failed, Start: 0, End: 900}}, 0)
+	if s.AckP50MS != 3 || s.AckP99MS != 3 {
+		t.Fatalf("latency must use acks only: %+v", s)
+	}
+}

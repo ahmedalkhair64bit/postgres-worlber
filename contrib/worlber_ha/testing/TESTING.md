@@ -87,6 +87,40 @@ done
 Building behind a TLS-intercepting proxy:
 `LAB_CA_CERT=/path/ca.crt LAB_BUILD_ARGS="--network host" ./lab.sh up`.
 
+### Chaos harness (load + faults, measured RTO/RPO)
+
+`chaos/run.sh` runs a fault scenario under write load and prints a verdict
+per run. Writers use `worlber-ledger` (built from `agent/cmd/worlber-ledger`).
+They write through the read-write listener (port 5000) on all three nodes.
+Every write attempt is logged as one of:
+- **ack**: COMMIT returned OK;
+- **failed**: an error before COMMIT was sent;
+- **unknown**: COMMIT was sent but its result is not known.
+
+Only **ack** rows count as data loss when they are missing.
+
+```bash
+./chaos/run.sh s1 5                     # kill -9 the primary's postmaster, 5 runs
+CHAOS_KEEP_PG=1 ./lab.sh up && ./lab.sh setup
+./chaos/run.sh s2 5                     # kill -9 the primary's agent; PostgreSQL stays up
+CHAOS_SOAK=30m ./chaos/run.sh s7        # no fault: false failovers, report cancellations
+```
+
+| Scenario | Fault | Pass |
+|---|---|---|
+| s1 | `kill -9` of the postmaster on the primary; its agent stays alive | 0 acked rows missing, RTO ≤ `CHAOS_RTO_MAX` (30s) |
+| s2 | `kill -9` of the agent on the primary; PostgreSQL keeps running (like systemd `KillMode=process`) | 0 acked rows missing, 0 acked rows only on the old primary, RTO ≤ 30s |
+| s7 | none, for `CHAOS_SOAK`; long reports on port 5001 | 0 acked rows missing, 0 automatic failovers |
+
+Each run writes `chaos/results/<scenario>-<stamp>-<n>.json`. It holds the
+ledger verdict (`acked`, `acked_missing`, `old_only_acked`, `rto_ms`, ack
+latency p50/p99), the cluster events since the run started, the old and new
+primary, and `pass`.
+
+To check a ledger by hand:
+`worlber-ledger verify --ledger run.ledger --dsn "<new primary>" [--old-dsn "<old primary>"] --fault-at <unix ms>`.
+It exits 1 when the run fails.
+
 ---
 
 ## B. Three real servers (VMs)

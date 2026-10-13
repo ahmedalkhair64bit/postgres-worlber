@@ -141,6 +141,21 @@ type Summary struct {
 	RTOMS        *int64 `json:"rto_ms,omitempty"`
 	Unrecovered  []int  `json:"unrecovered_clients,omitempty"`
 	DuplicateKey int    `json:"duplicate_keys"`
+	// Latency of acknowledged attempts (BEGIN..COMMIT), nearest rank.
+	AckP50MS int64 `json:"ack_p50_ms"`
+	AckP99MS int64 `json:"ack_p99_ms"`
+}
+
+// percentile returns the nearest-rank p-th percentile of sorted values.
+func percentile(sorted []int64, p int) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	rank := (p*len(sorted) + 99) / 100 // ceil(p/100 * n)
+	if rank < 1 {
+		rank = 1
+	}
+	return sorted[rank-1]
 }
 
 // Summarize computes counts, the largest ack gap and, when faultAt > 0, the
@@ -148,6 +163,7 @@ type Summary struct {
 func Summarize(recs []Record, faultAt int64) Summary {
 	var s Summary
 	acks := map[int][]int64{}
+	var lat []int64
 	seen := map[Key]bool{}
 	for _, r := range recs {
 		s.Attempts++
@@ -159,6 +175,7 @@ func Summarize(recs []Record, faultAt int64) Summary {
 		case Ack:
 			s.Acked++
 			acks[r.Client] = append(acks[r.Client], r.End)
+			lat = append(lat, r.End-r.Start)
 		case Failed:
 			s.Failed++
 		default:
@@ -176,6 +193,8 @@ func Summarize(recs []Record, faultAt int64) Summary {
 		clients = append(clients, c)
 	}
 	sort.Ints(clients)
+	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+	s.AckP50MS, s.AckP99MS = percentile(lat, 50), percentile(lat, 99)
 	if faultAt > 0 {
 		var rto int64
 		for _, c := range clients {
