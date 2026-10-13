@@ -1,0 +1,10 @@
+# Docker build context for contrib/worlber_ha/testing/docker/Dockerfile.
+# An in-tree configured build (config.status) makes the VPATH configure in
+# the image fail, so never send one; skip VCS data and test output too.
+.git
+tmp_install
+config.status
+config.log
+**/tmp_check
+**/results
+contrib/worlber_ha/agent/worlber-ha-agent
