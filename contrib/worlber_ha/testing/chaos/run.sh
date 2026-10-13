@@ -9,6 +9,7 @@
 #        needs the lab started with CHAOS_KEEP_PG=1)
 #   s3   freeze the whole primary node (docker pause) until the run ends
 #   s4   network partition of the primary until the run ends
+#   s2b  partition + SIGSTOP a backend so fast shutdown hangs (agent SIGKILLs)
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
 #
 # Every run writes results/<scenario>-<stamp>-<n>.json with the ledger verdict
@@ -171,6 +172,19 @@ fault_s4() {
     ! docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$(dc ps -q "$1")" | grep -qw "$NET"
 }
 
+# s2b: partition the primary (its agent stops confirming, so the lease
+# expires) and SIGSTOP a backend so fast shutdown hangs; the agent must
+# escalate to SIGKILL.  The agent stays alive to do that.
+fault_s2b() {
+    local c be
+    c=$(dc ps -q "$1")
+    be=$(dc exec -T "$1" bash -c "pgrep -f 'postgres:' | head -1" | tr -d '\r')
+    [ -n "$be" ] || { echo "s2b: no backend to stop on $1" >&2; return 1; }
+    dc exec -T "$1" kill -STOP "$be" || return 1
+    docker network disconnect "$NET" "$c" || return 1
+    ! docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c" | grep -qw "$NET"
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
     local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
@@ -224,11 +238,11 @@ run_one() { # run_one <scenario> <n> <stamp>
         docker unpause "$(dc ps -q "$p")" >/dev/null 2>&1 || true
         sleep 2
     fi
-    if [[ "$sc" =~ ^s[234]$ ]] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
+    if [[ "$sc" =~ ^(s2|s2b|s3|s4)$ ]] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
         if dc exec -T -u postgres "$p" pg_ctl -D /var/lib/postgresql/data status >/dev/null 2>&1; then
             old_state="running (not fenced)"
-            if [ "$sc" = s4 ]; then
-                # partitioned: read it from inside its container
+            if dc exec -T -u postgres "$p" pg_ctl -D /var/lib/postgresql/data status >/dev/null 2>&1; then
+                # still running (partitioned): read it from inside its container
                 dc exec -T -u postgres "$p" psql -X -qAt -d postgres \
                     -c "COPY (SELECT client, seq FROM worlber_ledger) TO STDOUT WITH CSV" >"$base.oldkeys" &&
                     old_args=(--old-keys "$base.oldkeys")
@@ -267,13 +281,22 @@ run_one() { # run_one <scenario> <n> <stamp>
           old_primary_checked: ($old_checked == "yes"), old_primary_state: $old_state, verdict: $v, reports: $reports,
           events: $ev, pass: $pass}' >"$base.json"
     log "$sc run $n: pass=$pass old=$p new=${newp:-none} rto_ms=$(jq '.summary.rto_ms // null' <<<"$verify") acked=$(jq '.acked // 0' <<<"$verify") missing=$(jq '.acked_missing // null' <<<"$verify") old_only_acked=$(jq '.old_only_acked // null' <<<"$verify") failovers=$failovers${old_state:+ old_primary=$old_state}"
+    if [ "$sc" = s2b ] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
+        local left
+        left=$(dc exec -T "$p" bash -c "pgrep -c postgres || true" 2>/dev/null | tr -d '\r')
+        left=${left:-0}
+        if [ "$left" != 0 ]; then
+            log "s2b run $n: $left postgres process(es) still alive on the old primary (SIGKILL escalation failed)"
+            pass=false
+        fi
+    fi
     [ "$sc" = s7 ] || restore "$p"
     [ "$pass" = true ]
 }
 
 sc=${1:-}
 runs=${2:-1}
-case "$sc" in s1|s2|s3|s4|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "$sc" in s1|s2|s2b|s3|s4|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)
 failed=0
