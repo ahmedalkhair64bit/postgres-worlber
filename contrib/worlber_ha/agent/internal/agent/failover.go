@@ -142,8 +142,33 @@ func (a *Agent) leaderLoop(ctx context.Context) {
 			a.readyTerm = term
 			a.mu.Unlock()
 		}
+		a.maybeOpenGate()
 		a.reconcileActualSync()
 		a.checkPrimary()
+	}
+}
+
+// maybeOpenGate opens the fencing gate once every member reports a fresh
+// heartbeat from an agent that understands fencing (version >= 2).  Until
+// then the cluster keeps the older behaviour.  It runs on the leader only.
+func (a *Agent) maybeOpenGate() {
+	st := a.fsm.Get()
+	if !st.Bootstrapped() || st.FencingGate {
+		return
+	}
+	members := make([]string, 0, len(st.Nodes))
+	for name := range st.Nodes {
+		hb, fresh := a.beat(name)
+		if !fresh || hb.Version < AgentVersion {
+			return // someone is old or silent: keep the gate closed
+		}
+		members = append(members, name)
+	}
+	sort.Strings(members)
+	if err := a.apply(fsm.Command{Op: "open_gate", GateMembers: members}); err != nil {
+		a.log.Warn("cannot open the fencing gate", "error", err)
+	} else {
+		a.log.Info("fencing gate opened: all members run the fencing agent")
 	}
 }
 
@@ -154,6 +179,9 @@ func (a *Agent) reconcileActualSync() {
 	st := a.fsm.Get()
 	if !st.Bootstrapped() || st.Paused() {
 		return
+	}
+	if !st.FencingGate {
+		return // actual_sync is a new op; do not commit it to a mixed cluster
 	}
 	seen, known := a.lastSync(st.Primary, st.Epoch)
 	if !known {

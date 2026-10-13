@@ -129,6 +129,24 @@ restart. Until then only the agent can fence; the fence worker, which works
 when the agent is dead, is not running. The agent turns `worlber_ha.fence` on by
 itself after the first lease is written.
 
+### Rolling upgrade from a pre-fencing version
+
+A cluster created at this version has fencing active from the start. When you
+upgrade an **older** cluster (one without the lease/fence agent), the new
+safety behaviour stays off until **every** node runs the new agent:
+
+* while any node still runs the old agent, the cluster keeps the older
+  behaviour: quorum-loss fencing only, and best-eligible failover (no lease
+  self-fencing, no `actual_sync`). This is what stops a half-upgraded cluster
+  from fencing a healthy node or committing an op an old node cannot apply.
+* the leader opens the **fencing gate** automatically once all members report
+  the new agent, recorded as a `fencing_gate_open` event. From then on the
+  lease fence worker and `actual_sync` failover are in force.
+
+Upgrade one node at a time (replicas first, then a switchover, then the old
+primary). Add `worlber_ha` to `shared_preload_libraries` and restart each
+node as you go so its fence worker is ready when the gate opens.
+
 `create_cluster` prepares the primary:
 * it creates the role `worlber_ha_repl` (REPLICATION, plus the `pg_rewind`
   function grants) with a random password;

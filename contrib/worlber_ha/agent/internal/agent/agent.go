@@ -51,12 +51,17 @@ type Config struct {
 
 // heartbeat is what each agent reports to the leader every tick.
 type heartbeat struct {
-	Node   string    `json:"node"`
-	Health pg.Health `json:"health"`
-	Status string    `json:"status"`
-	Epoch  uint64    `json:"epoch"`
-	At     time.Time `json:"-"`
+	Node    string    `json:"node"`
+	Health  pg.Health `json:"health"`
+	Status  string    `json:"status"`
+	Epoch   uint64    `json:"epoch"`
+	Version int       `json:"version"`
+	At      time.Time `json:"-"`
 }
+
+// AgentVersion is the agent's protocol version.  1 (or absent) is the
+// pre-fencing agent; 2 understands leases, confirmations and actual_sync.
+const AgentVersion = 2
 
 // Agent is a running node agent.
 type Agent struct {
@@ -334,7 +339,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		}
 		a.mu.Lock()
 		a.local = h
-		hb := heartbeat{Node: a.cfg.Name, Health: h, Status: a.status, Epoch: a.fsm.Get().Epoch}
+		hb := heartbeat{Node: a.cfg.Name, Health: h, Status: a.status, Epoch: a.fsm.Get().Epoch, Version: AgentVersion}
 		a.mu.Unlock()
 
 		st := a.fsm.Get()

@@ -74,6 +74,9 @@ func (a *Agent) confirmFor(hb heartbeat) bool {
 	if !a.isLeader() || !st.Bootstrapped() {
 		return false
 	}
+	if !st.FencingGate {
+		return st.Primary == hb.Node && st.Epoch == hb.Epoch
+	}
 	// A primary that is down past the cutoff is not confirmed only when the
 	// leader could actually replace it; otherwise (no candidate, paused)
 	// keep it able to restart.
@@ -228,6 +231,9 @@ func (a *Agent) fencingLoop(ctx context.Context) {
 		}
 		if a.cfg.Witness {
 			return
+		}
+		if !a.fsm.Get().FencingGate {
+			continue // older agents in the cluster: quorum-loss fencing only
 		}
 		h := a.localHealth()
 		if !h.Running || h.InRecovery {

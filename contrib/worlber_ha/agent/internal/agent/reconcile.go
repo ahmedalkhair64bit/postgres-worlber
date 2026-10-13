@@ -116,8 +116,9 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 	// while yet: otherwise the fence worker would stop the new primary, or
 	// worse, this node may no longer be the primary.
 	const leaseMargin = 500 * time.Millisecond
+	gated := st.FencingGate
 	if !a.pg.IsRunning() {
-		if !a.leaseFresh(leaseMargin) {
+		if gated && !a.leaseFresh(leaseMargin) {
 			a.setStatus("waiting for the cluster to confirm this primary (lease)")
 			return nil
 		}
@@ -132,7 +133,7 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 		return fmt.Errorf("primary not reachable: %s", h.Error)
 	}
 	if h.InRecovery {
-		if !a.leaseFresh(leaseMargin) {
+		if gated && !a.leaseFresh(leaseMargin) {
 			a.setStatus("waiting for the cluster to confirm this primary (lease)")
 			return nil
 		}

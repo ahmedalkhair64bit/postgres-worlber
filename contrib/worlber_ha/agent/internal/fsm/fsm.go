@@ -83,6 +83,13 @@ type State struct {
 	// promotes from it.  Committed by the leader as it changes, so a new
 	// leader still knows it.
 	ActualSync []string `json:"actual_sync,omitempty"`
+	// FencingGate is true once every member runs an agent that understands
+	// leases, confirmations and actual_sync.  Until then the cluster keeps
+	// the older behaviour (quorum-loss fencing only, best-eligible failover)
+	// so a rolling upgrade never self-fences a healthy node or diverges the
+	// FSM with ops an old agent cannot apply.  A cluster created at this
+	// version opens the gate at bootstrap.
+	FencingGate bool `json:"fencing_gate,omitempty"`
 }
 
 // Command is a state change committed through Raft.
@@ -107,6 +114,9 @@ type Command struct {
 
 	// actual_sync
 	SyncNodes []string `json:"sync_nodes,omitempty"`
+
+	// open_gate
+	GateMembers []string `json:"gate_members,omitempty"`
 
 	// event
 	Kind   string `json:"kind,omitempty"`
@@ -247,6 +257,7 @@ func (s *State) apply(c Command) error {
 		s.Nodes[c.Node.Name] = c.Node
 		s.Primary = c.Node.Name
 		s.Epoch = 1
+		s.FencingGate = true
 		s.event(c.Time, "cluster_created", c.Node.Name, "cluster "+c.ClusterName+" created")
 
 	case "add_node":
@@ -320,6 +331,28 @@ func (s *State) apply(c Command) error {
 			return fmt.Errorf("event requires a kind")
 		}
 		s.event(c.Time, c.Kind, c.Name, c.Detail)
+
+	case "open_gate":
+		if s.FencingGate {
+			return nil // already open
+		}
+		// Deterministic guard: the member set the leader checked must match
+		// the committed set, so a node added between the check and the commit
+		// cannot be left behind an open gate.
+		have := make(map[string]bool, len(s.Nodes))
+		for n := range s.Nodes {
+			have[n] = true
+		}
+		if len(c.GateMembers) != len(have) {
+			return fmt.Errorf("open_gate member set does not match the cluster")
+		}
+		for _, n := range c.GateMembers {
+			if !have[n] {
+				return fmt.Errorf("open_gate names unknown member %q", n)
+			}
+		}
+		s.FencingGate = true
+		s.event(c.Time, "fencing_gate_open", "", "all members run the fencing agent")
 
 	case "actual_sync":
 		for _, n := range c.SyncNodes {

@@ -683,7 +683,7 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 	}
 	if localOnly {
 		a.mu.Lock()
-		a.storeBeatLocked(heartbeat{Node: a.cfg.Name, Health: a.local, Status: a.status, Epoch: st.Epoch, At: time.Now()})
+		a.storeBeatLocked(heartbeat{Node: a.cfg.Name, Health: a.local, Status: a.status, Epoch: st.Epoch, Version: AgentVersion, At: time.Now()})
 		a.mu.Unlock()
 	}
 	phb, _ := a.beat(st.Primary)
@@ -956,10 +956,13 @@ func validateNewOption(key, value string) error {
 func (a *Agent) pickOptions(st fsm.State, primaryLSN uint64, automatic bool) PickOptions {
 	maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
 	return PickOptions{
-		PrimaryLSN:    primaryLSN,
-		MaxLag:        maxLag,
-		Strict:        st.Option("synchronous_mode") == "strict",
-		Automatic:     automatic,
+		PrimaryLSN: primaryLSN,
+		MaxLag:     maxLag,
+		Strict:     st.Option("synchronous_mode") == "strict",
+		// Before the fencing gate opens (rolling upgrade), there is no
+		// actual_sync set to rely on, so fail over like the older agent:
+		// best eligible standby.
+		Automatic:     automatic && st.FencingGate,
 		HasActualSync: len(st.ActualSync) > 0,
 		Async:         st.Option("async_failover"),
 	}
