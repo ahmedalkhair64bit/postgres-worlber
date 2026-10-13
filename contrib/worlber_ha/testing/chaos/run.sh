@@ -14,6 +14,7 @@
 #           cannot restart PostgreSQL near the failover deadline
 #   s5   kill the sync standby, then the primary; must block (async_failover never)
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
+#   s10  WAL archive catch-up: offline replica recovers from the archive
 #
 # Every run writes results/<scenario>-<stamp>-<n>.json with the ledger verdict
 # (acked rows missing, acked rows only on the old primary, RTO), the events
@@ -347,8 +348,89 @@ run_one() { # run_one <scenario> <n> <stamp>
     [ "$pass" = true ]
 }
 
+
+# s10: WAL archive catch-up.  Enable the archive, stop a replica, write WAL
+# past max_slot_wal_keep so its slot is invalidated, restart it, and check it
+# caught up from the archive (no reseed_started event, verify_table matches).
+cmd_s10() {
+    local rep base="$RESULTS/s10-$(date +%Y%m%d-%H%M%S)"
+    ensure_lab
+    local p; p=$(primary)
+    log "s10: clearing the archive and enabling it on the cluster"
+    dc exec -T -u postgres "$p" bash -c "rm -f /mnt/wal-archive/* 2>/dev/null || true"
+    sql "$p" "SELECT worlber_ha.set_config('wal_archive_dir', '/mnt/wal-archive')" >/dev/null
+    sql "$p" "SELECT worlber_ha.set_config('max_slot_wal_keep', '32MB')" >/dev/null
+    # the lab sets wal_keep_size=256MB, which would keep WAL regardless of the
+    # slot limit; drop it so a stopped replica's slot can be invalidated.
+    sql "$p" "ALTER SYSTEM SET wal_keep_size = 0" >/dev/null
+    sql "$p" "SELECT pg_reload_conf()" >/dev/null
+    sql "$p" "CREATE EXTENSION IF NOT EXISTS pgcrypto" >/dev/null
+    # archive_mode needs a restart on every node: restart the containers once.
+    log "s10: restarting nodes so archive_mode takes effect"
+    dc restart pg1 pg2 pg3 >/dev/null
+    wait_until 180 healthy || { log "s10: cluster not healthy after restart"; return 1; }
+    p=$(primary)
+    rep=$(anysql "SELECT node FROM worlber_ha.cluster_status WHERE role='replica' AND state='streaming' LIMIT 1")
+    [ -n "$rep" ] || { log "s10: no replica"; return 1; }
+
+    log "s10: stopping replica $rep"
+    dc stop "$rep" >/dev/null
+    log "s10: writing WAL on $p (2 GB) to invalidate $rep's slot"
+    # Incompressible random bytes (TOAST cannot shrink them); STORAGE external
+    # keeps them uncompressed. ~700 MB in batches, each followed by a WAL
+    # switch, comfortably past max_slot_wal_keep (64 MB).
+    sql "$p" "CREATE TABLE IF NOT EXISTS s10_bulk (id bigserial PRIMARY KEY, pad bytea)" >/dev/null
+    sql "$p" "ALTER TABLE s10_bulk ALTER COLUMN pad SET STORAGE external" >/dev/null
+    local b
+    for b in $(seq 1 24); do
+        # ~16 MB of incompressible bytes per batch -> ~384 MB total
+        sql "$p" "INSERT INTO s10_bulk (pad) SELECT gen_random_bytes(1024*1024) FROM generate_series(1,16)" >/dev/null
+        sql "$p" "SELECT pg_switch_wal()" >/dev/null
+    done
+    sql "$p" "CHECKPOINT" >/dev/null
+    local slotstat; slotstat=$(sql "$p" "SELECT coalesce(wal_status,'gone') FROM pg_replication_slots WHERE slot_name=(SELECT slot_name FROM worlber_ha.cluster_status WHERE node='$rep')" 2>/dev/null)
+    log "s10: slot for $rep is now '$slotstat'"
+    if [ "$slotstat" != lost ]; then
+        log "s10: SKIP - could not invalidate $rep's slot (wal_status=$slotstat); needs more WAL or a smaller max_slot_wal_keep here"
+        sql "$p" "SELECT worlber_ha.set_config('wal_archive_dir', '')" >/dev/null 2>&1 || true
+        sql "$p" "SELECT worlber_ha.set_config('max_slot_wal_keep', '100GB')" >/dev/null 2>&1 || true
+        dc start "$rep" >/dev/null 2>&1 || true
+        return 0
+    fi
+    local archived; archived=$(dc exec -T "$p" bash -c "ls /mnt/wal-archive | wc -l" | tr -d '\r')
+    log "s10: $archived files in the archive; restarting $rep"
+    local t0; t0=$(date +%s)
+    dc start "$rep" >/dev/null
+
+    # wait until the replica is streaming again (caught up)
+    if ! wait_until 600 "$rep streaming again" bash -c "[ \"\$($0 _streaming $rep)\" = t ]" 2>/dev/null; then
+        # fall back to a direct poll
+        local ok=
+        for _ in $(seq 1 600); do
+            [ "$(anysql "SELECT state FROM worlber_ha.cluster_status WHERE node='$rep'")" = streaming ] && { ok=1; break; }
+            sleep 1
+        done
+        [ -n "$ok" ] || { log "s10: $rep did not catch up"; return 1; }
+    fi
+    local caught=$(( $(date +%s) - t0 ))
+    local reseeds; reseeds=$(anysql "SELECT count(*) FROM worlber_ha.events WHERE node='$rep' AND kind IN ('reseed_started','standby_reseed') AND event_time > to_timestamp($t0)")
+    # every node must match the primary (bool_and over verify_table rows)
+    local match; match=$(sql "$p" "SELECT bool_and(matches_primary) FROM worlber_ha.verify_table('s10_bulk') WHERE role='replica'" 2>/dev/null)
+    local mbps; mbps=$(awk "BEGIN{printf \"%.1f\", $archived*16/$caught}")
+    log "s10: caught up in ${caught}s, archived_segments=$archived (~${mbps} MB/s WAL), reseeds=$reseeds, verify_table match=$match"
+    local matched=false
+    [ "$match" = t ] || [ "$match" = true ] && matched=true
+    jq -n --argjson caught "$caught" --argjson archived "$archived" --argjson reseeds "${reseeds:-0}" \
+        --argjson matched "$matched" --arg mbps "$mbps" \
+        '{scenario:"s10", catchup_s:$caught, archived_segments:$archived, reseeds:$reseeds, verify_match:$matched, wal_mbps:$mbps, pass:($reseeds==0 and $matched)}' \
+        | tee "$base.json"
+    [ "${reseeds:-1}" = 0 ] && [ "$matched" = true ]
+}
+
 sc=${1:-}
 runs=${2:-1}
+if [ "$sc" = s10 ]; then cmd_s10; exit $?; fi
+if [ "$sc" = _streaming ]; then anysql "SELECT state FROM worlber_ha.cluster_status WHERE node='$2'"; exit 0; fi
 case "$sc" in s1|s1late|s2|s2b|s3|s4|s5|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)

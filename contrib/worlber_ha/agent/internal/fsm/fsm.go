@@ -402,6 +402,10 @@ func ValidateOption(key, value string) error {
 		if value != "primary" && value != "none" {
 			return fmt.Errorf("ro_fallback must be 'primary' or 'none'")
 		}
+	case "wal_archive_dir":
+		// validated more strictly in the agent (validateArchiveDir)
+	case "archive_keep":
+		// a duration like 7d / 168h; checked at prune time
 	case "synchronous_mode":
 		if value != "available" && value != "strict" {
 			return fmt.Errorf("synchronous_mode must be 'available' or 'strict'")

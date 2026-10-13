@@ -78,21 +78,23 @@ type Agent struct {
 	// sync/quorum state while PostgreSQL was running (leader only).  A
 	// heartbeat from a crashed primary has no replica list and does not
 	// overwrite it.
-	syncSeen     map[string]syncView
-	local        pg.Health
-	status       string
-	holdUntil    time.Time // don't start PostgreSQL as primary (switchover)
-	holdEpoch    uint64    // ... but only while the epoch is unchanged
-	needRewind   bool
-	reinitReason string // set by reinit_node: wipe and re-seed this standby
-	noStreamAt   time.Time
-	quorumLost   time.Time
-	wasLeader    bool
-	leaderReady  bool   // barrier done in this leadership term
-	readyTerm    string // ... namely this Raft term
-	leaderSince  time.Time
-	primaryBad   time.Time
-	lastNoCand   time.Time
+	syncSeen          map[string]syncView
+	local             pg.Health
+	status            string
+	holdUntil         time.Time // don't start PostgreSQL as primary (switchover)
+	holdEpoch         uint64    // ... but only while the epoch is unchanged
+	needRewind        bool
+	reinitReason      string // set by reinit_node: wipe and re-seed this standby
+	noStreamAt        time.Time
+	archiveProgressAt time.Time // last time replay advanced during archive catch-up
+	lastReplay        uint64
+	quorumLost        time.Time
+	wasLeader         bool
+	leaderReady       bool   // barrier done in this leadership term
+	readyTerm         string // ... namely this Raft term
+	leaderSince       time.Time
+	primaryBad        time.Time
+	lastNoCand        time.Time
 
 	lease leaseState // fencing (lease.go)
 
@@ -247,6 +249,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); a.verifyLoop(ctx) }()
 	go func() { defer wg.Done(); a.leaseLoop(ctx) }()
 	go func() { defer wg.Done(); a.fencingLoop(ctx) }()
+	go func() { defer wg.Done(); a.retentionLoop(ctx) }()
 
 	<-ctx.Done()
 	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

@@ -12,6 +12,8 @@ STATE=/var/lib/worlber_ha
 
 mkdir -p "$SOCKDIR" "$STATE" "$(dirname "$PGDATA")"
 chown postgres:postgres "$SOCKDIR" "$STATE" "$(dirname "$PGDATA")"
+# shared WAL archive (W6), present only when the compose mounts it
+[ -d /mnt/wal-archive ] && chown postgres:postgres /mnt/wal-archive || true
 chmod 2775 "$SOCKDIR"
 
 as_pg() { runuser -u postgres -- "$@"; }

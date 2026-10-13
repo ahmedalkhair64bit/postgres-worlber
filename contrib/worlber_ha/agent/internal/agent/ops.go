@@ -944,6 +944,9 @@ func validateNewOption(key, value string) error {
 	if err := fsm.ValidateOption(key, value); err != nil {
 		return err
 	}
+	if key == "wal_archive_dir" {
+		return validateArchiveDir(value)
+	}
 	if key == "failover_timeout" {
 		if d, _ := time.ParseDuration(value); d < safety.MinFailoverTimeout {
 			return fmt.Errorf("failover_timeout must be at least %s: the old primary's lease must expire before a standby is promoted", safety.MinFailoverTimeout)

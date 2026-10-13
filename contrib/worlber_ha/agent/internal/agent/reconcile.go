@@ -155,6 +155,9 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 	if err := a.ensureSyncNames(ctx, st, h); err != nil {
 		return fmt.Errorf("synchronous_standby_names: %w", err)
 	}
+	if _, err := a.ensureArchiving(ctx); err != nil {
+		a.log.Warn("cannot configure WAL archiving", "error", err)
+	}
 	a.setStatus("")
 	return nil
 }
@@ -338,12 +341,14 @@ func (a *Agent) standbySettings(st fsm.State) map[string]*string {
 	ci, _ := a.primaryConnInfo(st)
 	port := fmt.Sprint(a.pg.Port)
 	slot := st.Nodes[a.cfg.Name].SlotName
-	return map[string]*string{
+	m := map[string]*string{
 		"port":                      &port,
 		"primary_conninfo":          &ci,
 		"primary_slot_name":         &slot,
 		"synchronous_standby_names": nil,
 	}
+	a.archiveSettings(st, m)
+	return m
 }
 
 func (a *Agent) reconcileReplica(ctx context.Context, st fsm.State) error {
@@ -448,6 +453,8 @@ func (a *Agent) followPrimary(ctx context.Context, st fsm.State, h pg.Health) er
 	a.mu.Lock()
 	if h.WalReceiver == "streaming" {
 		a.noStreamAt = time.Time{}
+		a.archiveProgressAt = time.Time{}
+		a.lastReplay = 0
 		a.mu.Unlock()
 		a.setStatus("")
 		return nil
@@ -462,6 +469,27 @@ func (a *Agent) followPrimary(ctx context.Context, st fsm.State, h pg.Health) er
 	// that the WAL this standby needs is gone (it was down too long), or
 	// that it diverged (e.g. it was ahead of the promoted node).
 	if since > 30*time.Second && a.primaryReachable(ctx, st) {
+		// With a WAL archive, a standby that fell behind replays missing
+		// segments from the archive (restore_command) instead of re-seeding.
+		// Suppress the re-seed/rewind while replay keeps advancing; only act
+		// after 120s with no progress.
+		if a.archiveDir(st) != "" {
+			a.mu.Lock()
+			advanced := h.ReplayLSN > a.lastReplay
+			if advanced {
+				a.lastReplay = h.ReplayLSN
+				a.archiveProgressAt = time.Now()
+			}
+			if a.archiveProgressAt.IsZero() {
+				a.archiveProgressAt = time.Now()
+			}
+			stalled := time.Since(a.archiveProgressAt)
+			a.mu.Unlock()
+			if advanced || stalled < 120*time.Second {
+				a.setStatus("catching up from the WAL archive")
+				return nil
+			}
+		}
 		if gone, why := a.walGone(ctx, st, h); gone {
 			a.mu.Lock()
 			a.noStreamAt = time.Time{}

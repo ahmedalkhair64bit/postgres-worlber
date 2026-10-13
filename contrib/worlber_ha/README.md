@@ -224,6 +224,37 @@ The lab (`testing/lab.sh`) has the listener on ports 5000/5001 and the VIP
 `172.28.0.100` enabled.
 
 
+### WAL archive: recovering a long-offline replica
+
+A replica that was down long enough for the primary to recycle the WAL it
+needs would normally have to be rebuilt from scratch (a full `pg_basebackup`).
+With a shared **WAL archive** it catches up from the archive instead.
+
+Set `wal_archive_dir` to a directory mounted on **every** node (NFS, or a
+bucket mounted with gcsfuse):
+
+```sql
+SELECT worlber_ha.set_config('wal_archive_dir', '/mnt/wal-archive');
+```
+
+The agent then, on every node:
+
+* turns on `archive_mode` and sets an idempotent `archive_command` that copies
+  each WAL segment into the archive (safe to retry after a crash);
+* sets a `restore_command` on the standbys, so a standby that falls behind
+  replays the missing segments from the archive on its own.
+
+`archive_mode` is a postmaster setting, so it takes effect at the next
+PostgreSQL restart (the agent records an `archive_restart_needed` event). A
+standby catching up from the archive is **not** re-seeded as long as its
+replay keeps advancing; a full re-seed happens only if replay makes no
+progress for 120 s or the segment is in neither the archive nor the primary.
+
+The leader prunes the archive to `archive_keep` (default `7d`) so a dead
+member cannot fill it forever. With a custom `archive_command`/`restore_command`
+(set directly with `set_config`) retention and free space are the operator's
+job.
+
 ### Read-only routing (lag-aware)
 
 The read-only listener (port 5001) spreads reads over the streaming

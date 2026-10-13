@@ -37,7 +37,7 @@ services:
       NODE_NAME: pg1
       INIT_PRIMARY: "1"
     ports: ["5441:5432", "5000:5000", "5001:5001"]
-    volumes: [pg1:/var/lib/postgresql, pg1state:/var/lib/worlber_ha]
+    volumes: [pg1:/var/lib/postgresql, pg1state:/var/lib/worlber_ha, archive:/mnt/wal-archive]
     networks: {lab: {ipv4_address: 172.28.0.11}}
 
   pg2:
@@ -45,7 +45,7 @@ services:
     hostname: pg2
     environment: {<<: *env, NODE_NAME: pg2}
     ports: ["5442:5432", "5010:5000", "5011:5001"]
-    volumes: [pg2:/var/lib/postgresql, pg2state:/var/lib/worlber_ha]
+    volumes: [pg2:/var/lib/postgresql, pg2state:/var/lib/worlber_ha, archive:/mnt/wal-archive]
     networks: {lab: {ipv4_address: 172.28.0.12}}
 
   pg3:
@@ -53,7 +53,7 @@ services:
     hostname: pg3
     environment: {<<: *env, NODE_NAME: pg3}
     ports: ["5443:5432", "5020:5000", "5021:5001"]
-    volumes: [pg3:/var/lib/postgresql, pg3state:/var/lib/worlber_ha]
+    volumes: [pg3:/var/lib/postgresql, pg3state:/var/lib/worlber_ha, archive:/mnt/wal-archive]
     networks: {lab: {ipv4_address: 172.28.0.13}}
 
   # Optional witness: docker compose --profile witness up -d
@@ -77,6 +77,7 @@ volumes:
   pg2: {}
   pg3: {}
   pg1state: {}
+  archive: {}
   pg2state: {}
   pg3state: {}
   witnessstate: {}
