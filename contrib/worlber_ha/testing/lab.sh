@@ -186,7 +186,7 @@ cmd_test() {
     check "pg2 streaming" wait_until 60 "pg2 streaming" is_role pg2 replica streaming
     check "pg3 streaming" wait_until 60 "pg3 streaming" is_role pg3 replica streaming
     check "pg2 is a synchronous standby" \
-        test "$(anysql "SELECT sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'")" = quorum
+        test "$(anysql "SELECT sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'")" = sync
     sql pg1 "CREATE TABLE lab_test (id int PRIMARY KEY, node text, at timestamptz DEFAULT now())"
     sql pg1 "INSERT INTO lab_test SELECT g, 'pg1' FROM generate_series(1, 1000) g"
     check "rows replicated to pg2" wait_until 30 "pg2 has 1000 rows" count_is pg2 1000
@@ -205,7 +205,7 @@ cmd_test() {
     check "remote_apply: row visible on sync replica pg2 immediately after COMMIT" \
         test "$(sql pg2 "SELECT count(*) FROM lab_test WHERE id = 1001")" = 1
     check "health_check reports a healthy cluster" test "$(anysql "SELECT string_agg(severity, ',') FROM worlber_ha.health_check()")" = OK
-    check "replication view lists both standbys" test "$(anysql "SELECT string_agg(node || ':' || sync_state, ',' ORDER BY node) FROM worlber_ha.replication")" = "pg2:quorum,pg3:async"
+    check "replication view lists both standbys" test "$(anysql "SELECT string_agg(node || ':' || sync_state, ',' ORDER BY node) FROM worlber_ha.replication")" = "pg2:sync,pg3:potential"
     check "join of pg2 is in the event log" wait_until 10 "seeding events" eq 2 anysql "SELECT count(*) FROM worlber_ha.events WHERE node = 'pg2' AND kind IN ('seeding_started', 'seeding_completed')"
     check "agent log of pg2 readable from SQL" test "$(sql pg1 "SELECT count(*) > 0 FROM worlber_ha.agent_log('pg2', 200) WHERE message LIKE '%base backup%'")" = t
 
@@ -225,13 +225,13 @@ cmd_test() {
     check "strict: committed row reached pg2" wait_until 30 "row on pg2" eq 1 sql pg2 "SELECT count(*) FROM lab_test WHERE id = 1002"
     wait
     sql pg1 "SELECT worlber_ha.set_config('synchronous_mode', 'available')" >/dev/null
-    wait_until 60 "pg2 synchronous again" eq quorum anysql "SELECT sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'" || true
+    wait_until 60 "pg2 synchronous again" eq sync anysql "SELECT sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'" || true
 
     echo "-- available mode: commits continue when the sync replica is down"
     dc stop pg2 >/dev/null
     check "available: commits continue without pg2" wait_until 20 "insert ok" timeout 3 docker compose -f "$COMPOSE" exec -T -u postgres pg1 psql -X -qAt -c "INSERT INTO lab_test VALUES (1003, 'available')"
     dc start pg2 >/dev/null
-    check "pg2 back and synchronous" wait_until 90 "pg2 quorum" eq "streaming:quorum" anysql "SELECT state || ':' || sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'"
+    check "pg2 back and synchronous" wait_until 90 "pg2 sync" eq "streaming:sync" anysql "SELECT state || ':' || sync_state FROM worlber_ha.cluster_status WHERE node = 'pg2'"
     sql pg1 "DELETE FROM lab_test WHERE id > 1000"
 
     echo; echo "== 1c. listener and VIP"
@@ -250,7 +250,7 @@ cmd_test() {
 
     echo; echo "== 3. crash of the primary (pg2) under write load: automatic failover, zero data loss"
     sql pg2 "SELECT worlber_ha.set_sync('pg1', true)" >/dev/null
-    check "pg1 is the synchronous standby of pg2" wait_until 60 "pg1 quorum" eq "streaming:quorum" \
+    check "pg1 is the synchronous standby of pg2" wait_until 60 "pg1 sync" eq "streaming:sync" \
         anysql "SELECT state || ':' || sync_state FROM worlber_ha.cluster_status WHERE node = 'pg1'"
     # A client on pg3 writes one row per transaction through the listener and
     # logs every id whose COMMIT was acknowledged.

@@ -190,11 +190,16 @@ does not copy data itself.
    writes and flushes it to the standby's disk.
 3. **Redo:** the standby's startup process replays (redoes) the WAL. Data
    becomes visible to read-only queries on the replica once it is replayed.
-4. **Synchronous commit:** for nodes added with `sync => true`, a COMMIT on
-   the primary waits until a synchronous standby has flushed the WAL. That is
-   PostgreSQL's `synchronous_commit = on`, managed through
-   `synchronous_standby_names = 'ANY 1 (...)'`. A session can ask for more or
-   less:
+4. **Synchronous commit:** a COMMIT on the primary waits until one
+   synchronous standby has flushed the WAL. That is PostgreSQL's
+   `synchronous_commit = on`, managed by the agent through
+   `synchronous_standby_names = 'FIRST 1 (...)'`. Nodes added with
+   `sync => true` are listed first. Every other standby follows as a
+   fallback, so a synchronous standby still exists when the node marked sync
+   is the primary itself (after a failover or switchover) or is down.
+   `health_check()` reports CRITICAL when no standby is synchronous, and a
+   WARNING when a fallback standby holds that role. A session can ask for
+   more or less:
    * `SET synchronous_commit = remote_apply`: wait until the standby has
      *replayed* the change (read-your-writes on the replica);
    * `remote_write`: the standby has received the change;

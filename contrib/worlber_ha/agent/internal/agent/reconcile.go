@@ -247,22 +247,39 @@ func (a *Agent) ensureSlots(ctx context.Context, st fsm.State) error {
 }
 
 // SyncNames computes synchronous_standby_names for the primary.
+//
+// It is always "FIRST 1 (...)": exactly one standby is synchronous at a time.
+// Standbys marked sync come first; every other standby follows as a
+// fallback, so the cluster keeps a synchronous standby when the node marked
+// sync is itself the primary (after a failover or switchover to it) or is
+// down.  PostgreSQL moves to the next listed standby on its own when the
+// current one disconnects.
+//
+// synchronous_mode "available" lists only connected standbys (no standby
+// connected: commits do not wait).  "strict" lists them all, so commits
+// wait until one of them is connected.
 func SyncNames(st fsm.State, self string, connected map[string]bool) string {
-	var names []string
 	strict := st.Option("synchronous_mode") == "strict"
+	var preferred, fallback []string
 	for _, n := range st.Nodes {
-		if n.Name == self || n.Witness || !n.Sync {
+		if n.Name == self || n.Witness {
 			continue
 		}
-		if strict || connected[n.Name] {
-			names = append(names, pg.QuoteIdent(n.Name))
+		if !strict && !connected[n.Name] {
+			continue
+		}
+		if n.Sync {
+			preferred = append(preferred, pg.QuoteIdent(n.Name))
+		} else {
+			fallback = append(fallback, pg.QuoteIdent(n.Name))
 		}
 	}
-	if len(names) == 0 {
+	if len(preferred)+len(fallback) == 0 {
 		return ""
 	}
-	sort.Strings(names)
-	return "ANY 1 (" + strings.Join(names, ", ") + ")"
+	sort.Strings(preferred)
+	sort.Strings(fallback)
+	return "FIRST 1 (" + strings.Join(append(preferred, fallback...), ", ") + ")"
 }
 
 func (a *Agent) ensureSyncNames(ctx context.Context, st fsm.State, h pg.Health) error {

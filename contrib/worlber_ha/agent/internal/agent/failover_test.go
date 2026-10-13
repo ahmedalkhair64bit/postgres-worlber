@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
+	"github.com/worlber/worlber-ha-agent/internal/pg"
 )
 
 func TestPickCandidate(t *testing.T) {
@@ -43,15 +44,58 @@ func TestSyncNames(t *testing.T) {
 		"p": {Name: "p", Sync: true}, "s1": {Name: "s1", Sync: true}, "s2": {Name: "s2", Sync: true},
 		"a": {Name: "a"}, "w": {Name: "w", Witness: true, Sync: true},
 	}}
-	if got := SyncNames(st, "p", map[string]bool{"s1": true}); got != `ANY 1 ("s1")` {
-		t.Errorf("available mode: %s", got)
+	all := map[string]bool{"s1": true, "s2": true, "a": true, "w": true}
+	cases := []struct {
+		name      string
+		self      string
+		connected map[string]bool
+		strict    bool
+		want      string
+	}{
+		{"sync-flagged first, async as fallback", "p", all, false, `FIRST 1 ("s1", "s2", "a")`},
+		{"only connected standbys in available mode", "p", map[string]bool{"s1": true}, false, `FIRST 1 ("s1")`},
+		{"async standby used when no sync-flagged one is connected", "p", map[string]bool{"a": true}, false, `FIRST 1 ("a")`},
+		{"nobody connected: commits do not wait", "p", nil, false, ""},
+		// The regression the chaos test S2 found: the only sync-flagged
+		// standby became the primary and nothing was synchronous any more.
+		{"primary is the sync-flagged node", "s1", map[string]bool{"p": true, "a": true}, false, `FIRST 1 ("p", "a")`},
+		{"strict lists every standby, connected or not", "p", nil, true, `FIRST 1 ("s1", "s2", "a")`},
 	}
-	if got := SyncNames(st, "p", nil); got != "" {
-		t.Errorf("available mode, nobody connected: %q", got)
+	for _, c := range cases {
+		st.Config["synchronous_mode"] = "available"
+		if c.strict {
+			st.Config["synchronous_mode"] = "strict"
+		}
+		if got := SyncNames(st, c.self, c.connected); got != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, got, c.want)
+		}
 	}
-	st.Config["synchronous_mode"] = "strict"
-	if got := SyncNames(st, "p", nil); got != `ANY 1 ("s1", "s2")` {
-		t.Errorf("strict mode: %s", got)
+}
+
+func TestLastSyncKeepsRunningPrimaryReport(t *testing.T) {
+	a := &Agent{beats: map[string]heartbeat{}, syncSeen: map[string]syncView{}}
+	running := heartbeat{Node: "p", Epoch: 3, Health: pg.Health{Running: true, Replicas: []pg.ReplicaStat{
+		{AppName: "s1", SyncState: "potential"}, {AppName: "a", SyncState: "sync"},
+	}}}
+	a.recordBeat(running)
+	got, ok := a.lastSync("p", 3)
+	if !ok || !got["a"] || got["s1"] {
+		t.Fatalf("got %v %v, want a only", got, ok)
+	}
+	// PostgreSQL crashed: the heartbeat has no replicas and must not erase
+	// what the running primary reported.
+	a.recordBeat(heartbeat{Node: "p", Epoch: 3, Health: pg.Health{Running: false}})
+	if got, ok := a.lastSync("p", 3); !ok || !got["a"] {
+		t.Fatalf("crashed-primary heartbeat erased the sync report: %v %v", got, ok)
+	}
+	// A report from another epoch is not used.
+	if _, ok := a.lastSync("p", 4); ok {
+		t.Fatal("report from epoch 3 used for epoch 4")
+	}
+	// A running primary with no sync standby is a known, empty set.
+	a.recordBeat(heartbeat{Node: "p", Epoch: 3, Health: pg.Health{Running: true}})
+	if got, ok := a.lastSync("p", 3); !ok || len(got) != 0 {
+		t.Fatalf("want known empty set, got %v %v", got, ok)
 	}
 }
 

@@ -462,12 +462,20 @@ func (a *Agent) removeNode(ctx context.Context, name string) (opResult, error) {
 // candidates returns failover candidates from the leader's heartbeats.
 func (a *Agent) candidates(st fsm.State) []Candidate {
 	var out []Candidate
+	// Prefer the standby the primary actually used as synchronous; the sync
+	// flag is only a preference and may name the primary itself.  Without a
+	// report from the running primary (new leader), fall back to the flag.
+	seen, known := a.lastSync(st.Primary, st.Epoch)
 	for _, n := range st.SortedNodes() {
 		if n.Name == st.Primary || n.Witness {
 			continue
 		}
 		hb, fresh := a.beat(n.Name)
-		out = append(out, Candidate{Name: n.Name, Sync: n.Sync, Fresh: fresh,
+		sync := n.Sync
+		if known {
+			sync = seen[n.Name]
+		}
+		out = append(out, Candidate{Name: n.Name, Sync: sync, Fresh: fresh,
 			Running: hb.Health.Running, InRecovery: hb.Health.InRecovery, LSN: hb.Health.LSN})
 	}
 	return out
@@ -660,7 +668,7 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 	}
 	if localOnly {
 		a.mu.Lock()
-		a.beats[a.cfg.Name] = heartbeat{Node: a.cfg.Name, Health: a.local, Status: a.status, At: time.Now()}
+		a.storeBeatLocked(heartbeat{Node: a.cfg.Name, Health: a.local, Status: a.status, Epoch: st.Epoch, At: time.Now()})
 		a.mu.Unlock()
 	}
 	phb, _ := a.beat(st.Primary)

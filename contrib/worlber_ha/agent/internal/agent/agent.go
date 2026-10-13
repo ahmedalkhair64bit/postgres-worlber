@@ -66,8 +66,13 @@ type Agent struct {
 	pg   *pg.Local
 	http *http.Client
 
-	mu           sync.Mutex
-	beats        map[string]heartbeat // leader only
+	mu    sync.Mutex
+	beats map[string]heartbeat // leader only
+	// syncSeen: for each primary, the standbys it last reported in
+	// sync/quorum state while PostgreSQL was running (leader only).  A
+	// heartbeat from a crashed primary has no replica list and does not
+	// overwrite it.
+	syncSeen     map[string]syncView
 	local        pg.Health
 	status       string
 	holdUntil    time.Time // don't start PostgreSQL as primary (switchover)
@@ -120,10 +125,11 @@ func New(cfg Config) (*Agent, error) {
 		logs: ring,
 		log: hclog.New(&hclog.LoggerOptions{Name: "worlber-ha[" + cfg.Name + "]", Level: lvl,
 			IndependentLevels: true, Output: io.MultiWriter(os.Stderr, ring)}),
-		fsm:   fsm.New(),
-		pg:    cfg.PG,
-		http:  &http.Client{Timeout: 15 * time.Second},
-		beats: map[string]heartbeat{},
+		fsm:      fsm.New(),
+		pg:       cfg.PG,
+		http:     &http.Client{Timeout: 15 * time.Second},
+		beats:    map[string]heartbeat{},
+		syncSeen: map[string]syncView{},
 
 		eventKick: make(chan struct{}, 1),
 	}
@@ -399,8 +405,42 @@ func (a *Agent) eventLoop(ctx context.Context) {
 func (a *Agent) recordBeat(hb heartbeat) {
 	hb.At = time.Now()
 	a.mu.Lock()
-	a.beats[hb.Node] = hb
+	a.storeBeatLocked(hb)
 	a.mu.Unlock()
+}
+
+// syncView is what a running primary last said about its standbys.
+type syncView struct {
+	epoch uint64
+	sync  map[string]bool // standbys in sync or quorum state
+	at    time.Time
+}
+
+// storeBeatLocked records a heartbeat; a.mu must be held.
+func (a *Agent) storeBeatLocked(hb heartbeat) {
+	a.beats[hb.Node] = hb
+	if hb.Health.Running && !hb.Health.InRecovery {
+		v := syncView{epoch: hb.Epoch, sync: map[string]bool{}, at: hb.At}
+		for _, r := range hb.Health.Replicas {
+			if r.SyncState == "sync" || r.SyncState == "quorum" {
+				v.sync[r.AppName] = true
+			}
+		}
+		a.syncSeen[hb.Node] = v
+	}
+}
+
+// lastSync returns the standbys the primary last reported as synchronous,
+// and false when this agent never saw a running heartbeat from it in the
+// current epoch (for example right after a leader change).
+func (a *Agent) lastSync(primary string, epoch uint64) (map[string]bool, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	v, ok := a.syncSeen[primary]
+	if !ok || v.epoch != epoch {
+		return nil, false
+	}
+	return v.sync, true
 }
 
 // beat returns the latest heartbeat of a node and whether it is fresh.

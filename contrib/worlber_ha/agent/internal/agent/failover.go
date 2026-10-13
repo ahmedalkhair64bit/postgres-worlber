@@ -183,6 +183,9 @@ func (a *Agent) lossEstimate(st fsm.State, cand string, primary heartbeat) strin
 			sync = r.SyncState
 		}
 	}
+	if seen, ok := a.lastSync(st.Primary, st.Epoch); ok && seen[cand] {
+		sync = "sync" // reported by the primary while it was still running
+	}
 	if sync == "sync" || sync == "quorum" {
 		return "estimated data loss: none (" + cand + " was a synchronous standby)"
 	}

@@ -132,11 +132,11 @@ is($res, 'streaming', 'node3 added as asynchronous replica');
 
 poll_cluster(
 	"SELECT string_agg(node || ':' || role || ':' || state || ':' || coalesce(sync_state, '-'), ' ' ORDER BY node) FROM worlber_ha.cluster_status",
-	'node1:primary:running:- node2:replica:streaming:quorum node3:replica:streaming:async',
+	'node1:primary:running:- node2:replica:streaming:sync node3:replica:streaming:potential',
 	[$n1], 'cluster status shows one primary and two streaming replicas');
 
 is($n1->safe_psql('postgres', 'SHOW synchronous_standby_names'),
-	'ANY 1 ("node2")', 'synchronous_standby_names managed by the agent');
+	'FIRST 1 ("node2", "node3")', 'synchronous_standby_names managed by the agent');
 
 $n1->safe_psql('postgres', 'CREATE TABLE t (id int); INSERT INTO t SELECT generate_series(1, 100)');
 poll_cluster('SELECT count(*) FROM t', '100', [$n2], 'data replicated to node2');

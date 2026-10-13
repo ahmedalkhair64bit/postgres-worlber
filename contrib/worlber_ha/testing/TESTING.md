@@ -231,7 +231,7 @@ worlber_ha.events` after each step.
 
 | # | Test | How | Expected |
 |---|---|---|---|
-| 1 | Replication | create a table and insert rows on the primary | rows visible on both replicas; `sync_state` = `quorum` for the sync node, `async` for the other |
+| 1 | Replication | create a table and insert rows on the primary | rows visible on both replicas; `sync_state` = `sync` for the sync node, `potential` for the other |
 | 2 | Sync commit | stop the sync replica (`systemctl stop worlber-ha-agent; pg_ctl stop`) and insert | default mode `available`: insert still succeeds; `synchronous_standby_names` becomes empty |
 | 3 | Strict mode | `SELECT worlber_ha.set_config('synchronous_mode','strict')`, then repeat 2 | insert waits until the sync replica is back |
 | 4 | Switchover | `SELECT worlber_ha.switchover('db2')` | db2 primary within seconds, db1 `streaming`, no data lost |
