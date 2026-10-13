@@ -10,6 +10,8 @@
 #   s3   freeze the whole primary node (docker pause) until the run ends
 #   s4   network partition of the primary until the run ends
 #   s2b  partition + SIGSTOP a backend so fast shutdown hangs (agent SIGKILLs)
+#   s1late  kill the postmaster and freeze the agent ~19s (CHAOS_LATE) so it
+#           cannot restart PostgreSQL near the failover deadline
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
 #
 # Every run writes results/<scenario>-<stamp>-<n>.json with the ledger verdict
@@ -110,6 +112,7 @@ restore() { # restore <node>: bring a faulted node back and wait for health
     if healthy && dc exec -T "$node" pidof worlber-ha-agent >/dev/null 2>&1; then
         return 0
     fi
+    dc exec -T "$node" bash -c "pidof worlber-ha-agent >/dev/null && kill -CONT \$(pidof worlber-ha-agent)" 2>/dev/null || true
     log "restoring $node"
     dc restart "$node" >/dev/null
     if ! wait_until 240 healthy; then
@@ -185,6 +188,18 @@ fault_s2b() {
     ! docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c" | grep -qw "$NET"
 }
 
+fault_s1late() {
+    local pid agent
+    pid=$(dc exec -T "$1" head -1 /var/lib/postgresql/data/postmaster.pid | tr -d '\r')
+    agent=$(dc exec -T "$1" pidof worlber-ha-agent | tr -d '\r')
+    [ -n "$pid" ] && [ -n "$agent" ] || { echo "s1late: no postmaster/agent on $1" >&2; return 1; }
+    # freeze the agent first so it cannot restart PostgreSQL after the kill
+    dc exec -T "$1" kill -STOP $agent || return 1
+    dc exec -T "$1" kill -9 "$pid" || return 1
+    ( sleep "${CHAOS_LATE:-19}"; dc exec -T "$1" kill -CONT $agent >/dev/null 2>&1 ) &
+    dc exec -T "$1" bash -c "! kill -0 $pid 2>/dev/null"
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
     local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
@@ -238,7 +253,7 @@ run_one() { # run_one <scenario> <n> <stamp>
         docker unpause "$(dc ps -q "$p")" >/dev/null 2>&1 || true
         sleep 2
     fi
-    if [[ "$sc" =~ ^(s2|s2b|s3|s4)$ ]] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
+    if [[ "$sc" =~ ^(s2|s2b|s3|s4|s1late)$ ]] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
         if dc exec -T -u postgres "$p" pg_ctl -D /var/lib/postgresql/data status >/dev/null 2>&1; then
             old_state="running (not fenced)"
             if dc exec -T -u postgres "$p" pg_ctl -D /var/lib/postgresql/data status >/dev/null 2>&1; then
@@ -296,7 +311,7 @@ run_one() { # run_one <scenario> <n> <stamp>
 
 sc=${1:-}
 runs=${2:-1}
-case "$sc" in s1|s2|s2b|s3|s4|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "$sc" in s1|s1late|s2|s2b|s3|s4|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)
 failed=0
