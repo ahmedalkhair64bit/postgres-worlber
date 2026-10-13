@@ -32,6 +32,8 @@ const (
 var DefaultConfig = map[string]string{
 	"failover_timeout":        "30s",
 	"async_failover":          "never",
+	"ro_max_lag":              "0",
+	"ro_fallback":             "primary",
 	"maximum_lag_on_failover": "16MB",
 	"synchronous_mode":        "available", // available | strict
 	"paused":                  "false",
@@ -391,6 +393,14 @@ func ValidateOption(key, value string) error {
 	case "async_failover":
 		if value != "never" && value != "within_lag" {
 			return fmt.Errorf("async_failover must be 'never' or 'within_lag'")
+		}
+	case "ro_max_lag":
+		if _, err := ParseBytes(value); err != nil {
+			return err
+		}
+	case "ro_fallback":
+		if value != "primary" && value != "none" {
+			return fmt.Errorf("ro_fallback must be 'primary' or 'none'")
 		}
 	case "synchronous_mode":
 		if value != "available" && value != "strict" {

@@ -223,6 +223,20 @@ applications to always find the primary:
 The lab (`testing/lab.sh`) has the listener on ports 5000/5001 and the VIP
 `172.28.0.100` enabled.
 
+
+### Read-only routing (lag-aware)
+
+The read-only listener (port 5001) spreads reads over the streaming
+standbys. Two options tune it (set with `worlber_ha.set_config`):
+
+* `ro_max_lag` (default `0` = no limit): a standby lagging more than this is
+  dropped from the read pool, so stale replicas do not serve reads. Example:
+  `SELECT worlber_ha.set_config('ro_max_lag', '16MB')`.
+* `ro_fallback` (default `primary`): when no standby qualifies, reads fall
+  back to the primary. Set to `none` to return no target instead (reads fail
+  rather than hit the primary), except that the primary is still used when
+  there is no streaming standby at all.
+
 ## How data is replicated
 
 worlber_ha uses PostgreSQL's built-in physical streaming replication. It
