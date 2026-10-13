@@ -53,9 +53,24 @@ that just died, failover would die with it.
 ### Split-brain protection
 
 * Changing the primary is a Raft commit, so only a majority of agents can do it.
-* **Fencing.** The agent on the primary stops PostgreSQL (fast shutdown) when it
-  loses contact with the Raft majority for `failover_timeout / 3`. The majority
-  only promotes another node after `failover_timeout`.
+* **Fencing with a lease.** The primary holds a lease file
+  (`$PGDATA/worlber_ha.lease`). Its agent renews it only while the Raft leader
+  confirms, in the reply to each heartbeat, that this node is still the
+  primary.
+  * A **fence worker inside PostgreSQL** checks the lease every 500 ms and shuts
+    the server down once it is older than its TTL (`failover_timeout / 3`).
+    Because it runs in PostgreSQL, it works even when the agent is dead or hung.
+  * The agent stops PostgreSQL the same way, and escalates to SIGKILL if a fast
+    shutdown hangs for more than 5 s.
+  * The leader stops confirming the old primary before a failover. It then
+    waits `2s + TTL + 2.5s` after the last confirmation before promoting a
+    standby. By then the old primary has been fenced, so two primaries never
+    accept writes at the same time.
+  * The lease is stamped with `CLOCK_BOOTTIME`, which is not moved by NTP or by
+    hand and keeps counting while a VM or container is paused.
+  * `failover_timeout` must be at least 7 seconds for this bound to hold.
+* The agent on the primary also stops PostgreSQL (fast shutdown) when it loses
+  contact with the Raft majority for `failover_timeout / 3`.
 * An agent only starts or promotes PostgreSQL as primary, or demotes it, after
   the Raft leader confirms the current epoch. A restarted agent replaying an old
   Raft log can therefore never bring back a stale primary.
@@ -100,6 +115,19 @@ worlber-ha-agent \
   another database system is never overwritten unless you pass
   `--reinit-pgdata`.
 * A **witness** only needs `--witness`, the token and the addresses.
+
+**Fencing needs `worlber_ha` in `shared_preload_libraries`** on every node,
+like `pg_stat_statements`:
+
+```
+shared_preload_libraries = 'worlber_ha'      # append to an existing list
+```
+
+If it is missing, the agent adds it with `ALTER SYSTEM` and records a
+`fencing_inactive` event. Fencing then becomes active at the next PostgreSQL
+restart. Until then only the agent can fence; the fence worker, which works
+when the agent is dead, is not running. The agent turns `worlber_ha.fence` on by
+itself after the first lease is written.
 
 `create_cluster` prepares the primary:
 * it creates the role `worlber_ha_repl` (REPLICATION, plus the `pg_rewind`

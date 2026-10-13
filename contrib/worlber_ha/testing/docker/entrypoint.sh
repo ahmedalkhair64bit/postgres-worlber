@@ -30,6 +30,9 @@ unix_socket_directories = '$SOCKDIR'
 wal_keep_size = '256MB'
 log_destination = 'stderr'
 logging_collector = off
+# fence worker: stops this server if it is primary and its agent stopped
+# confirming it with the cluster (worlber_ha.fence is turned on by the agent)
+shared_preload_libraries = 'worlber_ha'
 CONF
     # application access from the lab network (and the docker host)
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"

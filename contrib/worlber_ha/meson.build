@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Worlber
 
 worlber_ha_sources = files(
+  'fence.c',
   'worlber_ha.c',
 )
 

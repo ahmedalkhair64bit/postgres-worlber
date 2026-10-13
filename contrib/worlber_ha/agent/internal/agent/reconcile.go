@@ -112,7 +112,15 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 	if !a.pg.HasDataDir() {
 		return fmt.Errorf("PGDATA %s has no database cluster", a.pg.PGData)
 	}
+	// Start or promote only with a lease the cluster confirmed, valid for a
+	// while yet: otherwise the fence worker would stop the new primary, or
+	// worse, this node may no longer be the primary.
+	const leaseMargin = 500 * time.Millisecond
 	if !a.pg.IsRunning() {
+		if !a.leaseFresh(leaseMargin) {
+			a.setStatus("waiting for the cluster to confirm this primary (lease)")
+			return nil
+		}
 		a.setStatus("starting primary")
 		if err := a.pg.Start(ctx); err != nil {
 			return err
@@ -124,6 +132,10 @@ func (a *Agent) reconcilePrimary(ctx context.Context, st fsm.State) error {
 		return fmt.Errorf("primary not reachable: %s", h.Error)
 	}
 	if h.InRecovery {
+		if !a.leaseFresh(leaseMargin) {
+			a.setStatus("waiting for the cluster to confirm this primary (lease)")
+			return nil
+		}
 		a.log.Info("promoting local standby", "epoch", st.Epoch)
 		a.setStatus("promoting")
 		if err := a.pg.Promote(ctx); err != nil {

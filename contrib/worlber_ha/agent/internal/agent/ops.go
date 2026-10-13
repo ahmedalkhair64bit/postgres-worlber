@@ -18,6 +18,7 @@ import (
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
 	"github.com/worlber/worlber-ha-agent/internal/pg"
+	"github.com/worlber/worlber-ha-agent/internal/safety"
 )
 
 // localOps run on the agent that received the call; everything else is
@@ -152,7 +153,7 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	case "set_config":
 		var req struct{ Key, Value string }
 		_ = json.Unmarshal(args, &req)
-		if err := fsm.ValidateOption(req.Key, req.Value); err != nil {
+		if err := validateNewOption(req.Key, req.Value); err != nil {
 			return opResult{}, err
 		}
 		return opResult{Result: "ok"}, a.apply(fsm.Command{Op: "set_config", Key: req.Key, Value: req.Value})
@@ -202,7 +203,7 @@ func (a *Agent) createCluster(ctx context.Context, args json.RawMessage) (opResu
 	}
 	for k, v := range map[string]string{"synchronous_mode": req.SynchronousMode, "failover_timeout": req.FailoverTimeout} {
 		if v != "" {
-			if err := fsm.ValidateOption(k, v); err != nil {
+			if err := validateNewOption(k, v); err != nil {
 				return opResult{}, err
 			}
 		}
@@ -631,9 +632,20 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 	if hb, fresh := a.beat(target); !fresh || !hb.Health.Running {
 		return opResult{}, fmt.Errorf("target %q is not running", target)
 	}
+	// Stop confirming the old primary and wait until its lease is gone, so
+	// it cannot accept writes once the target is promoted.
+	for {
+		ok, left := a.beginFailover(st)
+		if ok {
+			break
+		}
+		a.log.Info("manual failover: waiting for the old primary's lease to expire", "left", left.Round(100*time.Millisecond))
+		time.Sleep(left)
+	}
 	phb, _ := a.beat(st.Primary)
 	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "manual_failover",
-		Detail: a.lossEstimate(st, target, phb)}); err != nil {
+		Detail: a.lossEstimate(st, target, phb) + "; old primary fenced (lease expired)"}); err != nil {
+		a.abortFailover()
 		return opResult{}, err
 	}
 	return opResult{Result: map[string]any{"old_primary": st.Primary, "new_primary": target}}, nil
@@ -920,4 +932,19 @@ func (a *Agent) localFingerprint(ctx context.Context, db, table, waitLSN string)
 	        count(*), coalesce(md5(string_agg(md5(t::text), '' ORDER BY md5(t::text))), md5(''))
 	        FROM `+ident+` t`).Scan(&fp.LSN, &fp.Rows, &fp.MD5)
 	return fp, err
+}
+
+// validateNewOption checks an option set by a DBA now.  It may be stricter
+// than fsm.ValidateOption, which must keep accepting what older versions
+// committed to the Raft log.
+func validateNewOption(key, value string) error {
+	if err := fsm.ValidateOption(key, value); err != nil {
+		return err
+	}
+	if key == "failover_timeout" {
+		if d, _ := time.ParseDuration(value); d < safety.MinFailoverTimeout {
+			return fmt.Errorf("failover_timeout must be at least %s: the old primary's lease must expire before a standby is promoted", safety.MinFailoverTimeout)
+		}
+	}
+	return nil
 }

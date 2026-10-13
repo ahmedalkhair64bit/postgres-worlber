@@ -117,7 +117,7 @@ my ($n1, $n2, $n3) = @nodes;
 # --- Build the cluster from psql -----------------------------------------
 $n1->safe_psql('postgres', 'CREATE EXTENSION worlber_ha');
 my $res = $n1->safe_psql('postgres',
-	"SELECT worlber_ha.create_cluster('prod', failover_timeout => '6 seconds')->>'primary'");
+	"SELECT worlber_ha.create_cluster('prod', failover_timeout => '7 seconds')->>'primary'");
 is($res, 'node1', 'create_cluster makes node1 the primary');
 
 my ($ret, $out, $err) = $n1->psql('postgres', "SELECT worlber_ha.create_cluster('again')");

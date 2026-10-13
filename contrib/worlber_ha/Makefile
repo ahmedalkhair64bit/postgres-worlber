@@ -3,6 +3,7 @@
 MODULE_big = worlber_ha
 OBJS = \
 	$(WIN32RES) \
+	fence.o \
 	worlber_ha.o
 
 EXTENSION = worlber_ha

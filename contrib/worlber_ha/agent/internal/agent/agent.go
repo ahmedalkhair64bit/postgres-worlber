@@ -22,6 +22,7 @@ import (
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
 	"github.com/worlber/worlber-ha-agent/internal/pg"
+	"github.com/worlber/worlber-ha-agent/internal/safety"
 )
 
 // Config is the static configuration of one agent.
@@ -87,6 +88,8 @@ type Agent struct {
 	leaderSince  time.Time
 	primaryBad   time.Time
 	lastNoCand   time.Time
+
+	lease leaseState // fencing (lease.go)
 
 	opMu sync.Mutex // serializes leader operations (switchover, failover...)
 
@@ -236,6 +239,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
 	go func() { defer wg.Done(); a.reconcileLoop(ctx) }()
 	go func() { defer wg.Done(); a.leaderLoop(ctx) }()
+	go func() { defer wg.Done(); a.verifyLoop(ctx) }()
+	go func() { defer wg.Done(); a.leaseLoop(ctx) }()
+	go func() { defer wg.Done(); a.fencingLoop(ctx) }()
 
 	<-ctx.Done()
 	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -335,15 +341,34 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		if _, member := st.Nodes[a.cfg.Name]; !member {
 			continue
 		}
+		if !h.Running {
+			a.mu.Lock()
+			a.lease.fenceChecked = false // check the fence settings after the next start
+			a.mu.Unlock()
+		} else if !a.cfg.Witness {
+			a.ensureFence(ctx, h)
+		}
+		// The lease may only be stamped with the time this heartbeat was
+		// sent: the leader saw us no earlier than that.
+		sent := safety.BootTime()
 		if a.isLeader() {
 			a.recordBeat(hb)
+			if a.confirmFor(hb) {
+				a.setConfirmed(sent)
+			}
 			continue
 		}
 		addr, err := a.leaderAPI()
 		if err != nil {
 			continue
 		}
-		_ = a.peerPost(ctx, addr, "/peer/heartbeat", hb, nil)
+		var rep struct {
+			Confirm bool `json:"confirm"`
+		}
+		// A reply older than safety.Q is useless for the lease anyway.
+		if err := a.peerPostTimeout(ctx, addr, "/peer/heartbeat", hb, &rep, safety.Q); err == nil && rep.Confirm {
+			a.setConfirmed(sent)
+		}
 	}
 }
 

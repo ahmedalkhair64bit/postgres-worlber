@@ -85,7 +85,7 @@ func (a *Agent) peerHandler() http.Handler {
 			return
 		}
 		a.recordBeat(hb)
-		writeReply(w, opResult{}, nil)
+		writeReply(w, opResult{Result: map[string]bool{"confirm": a.confirmFor(hb)}}, nil)
 	})
 	mux.HandleFunc("/peer/op/", func(w http.ResponseWriter, r *http.Request) {
 		op := strings.TrimPrefix(r.URL.Path, "/peer/op/")

@@ -7,6 +7,7 @@ require (
 	github.com/hashicorp/raft v1.7.1
 	github.com/hashicorp/raft-boltdb/v2 v2.3.0
 	github.com/jackc/pgx/v5 v5.7.2
+	golang.org/x/sys v0.28.0
 )
 
 require (
@@ -22,6 +23,5 @@ require (
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 	golang.org/x/crypto v0.31.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 )

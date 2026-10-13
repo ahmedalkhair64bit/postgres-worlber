@@ -109,6 +109,7 @@ func (a *Agent) checkPrimary() {
 	if !st.Bootstrapped() || st.Paused() {
 		a.mu.Lock()
 		a.primaryBad = time.Time{}
+		a.lease.failingOver = false
 		a.mu.Unlock()
 		return
 	}
@@ -117,6 +118,9 @@ func (a *Agent) checkPrimary() {
 	a.mu.Lock()
 	if healthy {
 		a.primaryBad = time.Time{}
+		// a failover that was waiting for the fence is no longer wanted:
+		// confirm this primary again
+		a.lease.failingOver = false
 		a.mu.Unlock()
 		return
 	}
@@ -161,11 +165,18 @@ func (a *Agent) checkPrimary() {
 		a.mu.Unlock()
 		return
 	}
+	// Fence wait: no more confirmations for the old primary from now on,
+	// and no promotion until the last one it got has run out.
+	if ok, left := a.beginFailover(st); !ok {
+		a.log.Info("failover: waiting for the old primary's lease to expire", "primary", st.Primary, "left", left.Round(100*time.Millisecond))
+		return
+	}
 	loss := a.lossEstimate(st, name, hb)
 	a.log.Warn("automatic failover", "old_primary", st.Primary, "new_primary", name, "down_for", badFor.Round(time.Second), "data_loss", loss)
 	if err := a.apply(fsm.Command{Op: "set_primary", Name: name, ExpectedEpoch: st.Epoch, Reason: "automatic_failover",
-		Detail: fmt.Sprintf("primary down for %s; %s", badFor.Round(time.Second), loss)}); err != nil {
+		Detail: fmt.Sprintf("primary down for %s; %s; old primary fenced (lease expired)", badFor.Round(time.Second), loss)}); err != nil {
 		a.log.Error("failover commit failed", "error", err)
+		a.abortFailover()
 		return
 	}
 	a.mu.Lock()
