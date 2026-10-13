@@ -141,7 +141,7 @@ Independent Claude subagent (Codex not installed), cold read:
     listener (and through the VIP in S1/S4).
   - Per run: the maximum over all clients.
   - Lab matrix: 20 runs per fault scenario per TPS rung. The RTO p95 gate
-    (nearest rank, the 19th of 20) applies to S1–S6 and S2b. S5b is gated on
+    (nearest rank, the 19th of 20) applies to S1–S4, S6 and S2b. S5b is gated on
     RPO only.
   - **Health timer:** the leader's failover timer starts at the last heartbeat
     reporting `Running=true`. The 3-probe rule only decides when the
@@ -228,11 +228,26 @@ Independent Claude subagent (Codex not installed), cold read:
      follows the new primary.
   4. Expected: 0 acknowledged rows on the old primary that are missing on the
      new one.
-- **Agent-side fencing goroutine (unconditional):** fencing inside the agent
-  moves to its own goroutine with a hard deadline and a SIGKILL fallback; it
-  is the only component that escalates to SIGKILL. Scenario **S2b** (a
-  blocked reconcile injected through a debug-only flag, plus a partition)
-  proves fencing still happens.
+- **Agent-side fencing goroutine (unconditional).** It is the only component
+  that escalates to SIGKILL.
+  - When it fences, it sends SIGINT to the postmaster. If PostgreSQL is still
+    up 5s later, it sends SIGKILL to every process of the instance: the
+    postmaster PID from `postmaster.pid` and all its children.
+  - Scenario **S2b** makes fast shutdown hang (a backend in an uninterruptible
+    wait, through a debug hook built only with the Go build tag
+    `chaosdebug`), together with a blocked reconcile.
+  - S2b pass: no process of the old primary is left after lease expiry + 6s.
+- **PostgreSQL dies, agent lives (S1). Suspend + fence wait:**
+  - After 3 failed probes the agent reports `Running=false`, and the leader
+    commits `suspend_primary(epoch)`.
+  - The suspended agent stops renewing the lease and does not restart
+    PostgreSQL as primary until the leader commits `resume_primary(epoch)`.
+  - Promotion waits until `Q + lease_ttl + 0.5s + 2s` has passed since the
+    suspension, or since the last heartbeat if the agent is silent. That is
+    inside the 20s timeout, so RTO is unchanged.
+  - The receipt's `fence_confirmed` records the wait.
+  - S1 includes a variant where PostgreSQL restarts at about 19s; it must
+    never accept writes after the suspension.
 - **VIP when the agent is dead:**
   - The fence worker cannot remove the VIP (no NET_ADMIN), and we accept
     that. Safety comes from PostgreSQL being stopped by the lease, plus the
@@ -375,8 +390,6 @@ Independent Claude subagent (Codex not installed), cold read:
 ## Open Questions
 - Real target numbers (TPS, database size, longest report, connections) for
   the pass bars. See the Assignment.
-- When the drill may run in production (only in a maintenance window, or at
-  any time with its preconditions).
 
 ## Success Criteria
 Run on the docker lab at a ladder of 1k / 5k / 20k TPS, or the highest rung
@@ -415,9 +428,11 @@ takes about 20h, run as a weekend batch.
   published to a `scorecard` branch, with a badge and a 30-run table.
 - CI (GitHub Actions):
   - each PR: Go tests and the regression test;
-  - nightly on a self-hosted or larger runner with Docker and NET_ADMIN: the
-    chaos smoke S1/S2/S4 at 1k TPS, 3 runs each, gated on the **maximum**
-    RTO < 30s and 0 acknowledged rows missing, about 15 minutes;
+  - nightly on a GitHub-hosted `ubuntu-latest` runner (no self-hosted
+    runner): the chaos smoke S1/S2/S4 at the highest TPS the runner sustains
+    (recorded), 3 runs each, gated on the **maximum** RTO < 30s and 0
+    acknowledged rows missing, about 15 minutes. Every run is published to
+    the `scorecard` branch (working plan W7);
   - the full matrix and the TPS ladder run on the lab host.
 - The demo: `testing/lab.sh demo`, one command for the pull-the-plug show.
 - Extension version 1.3, with a `worlber_ha--1.2--1.3.sql` upgrade script for
@@ -431,7 +446,10 @@ takes about 20h, run as a weekend batch.
 3. Last good LSN, `actual_sync`, `async_failover`. Then S1/S5 pass.
 4. Replica report policy, the lag-aware listener, S8.
 5. Canary, `worlber_ha.proof`, `drill()`, failover receipts (extension 1.3).
-6. Nightly CI smoke; publish the measured numbers in the README.
+6. WAL archive catch-up and S10 (working plan W6).
+7. S9 rolling 1.2 → 1.3 upgrade with the version gate (W8).
+8. Nightly CI smoke and the public scorecard on the `scorecard` branch (W7).
+9. Record the deferred items in TODOS.md (W9).
 
 ## The Assignment
 Run `contrib/worlber_ha/testing/lab.sh test` on your own machine this week.
