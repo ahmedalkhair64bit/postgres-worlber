@@ -56,8 +56,9 @@ pg_auto_failover (web search, 2026-10-13).
    replica; never split brain or false failover; switchover in seconds.
 4. Easy to get and reproduce. Published images/packages, a one-command demo,
    and per-node setup reduced to "install + join with a token". This design
-   covers the images and the demo. "Install + join with a token" is
-   **deferred to a follow-up design**, because premise 1 puts proof first.
+   covers the images and the demo. "Install + join with a token" was first
+   deferred, then **pulled into scope by the CEO review (D12)** as working
+   plan W10: deb/rpm, `worlber-ha-agent init`, `worlber_ha.join_token()`.
 
 ## Cross-Model Perspective
 Independent Claude subagent (Codex not installed), cold read:
@@ -230,24 +231,33 @@ Independent Claude subagent (Codex not installed), cold read:
      new one.
 - **Agent-side fencing goroutine (unconditional).** It is the only component
   that escalates to SIGKILL.
+  - **Trigger:** it runs on its own `CLOCK_BOOTTIME` ticker, independent of
+    reconcile. It fences when its own last lease is older than `lease_ttl`.
   - When it fences, it sends SIGINT to the postmaster. If PostgreSQL is still
-    up 5s later, it sends SIGKILL to every process of the instance: the
-    postmaster PID from `postmaster.pid` and all its children.
-  - Scenario **S2b** makes fast shutdown hang (a backend in an uninterruptible
-    wait, through a debug hook built only with the Go build tag
-    `chaosdebug`), together with a blocked reconcile.
+    up 5s later, it lists the postmaster's children first, then sends SIGKILL
+    to the children, then to the postmaster.
+  - Scenario **S2b**: the harness sends `SIGSTOP` to one backend, so fast
+    shutdown hangs but SIGKILL still works. The Go build tag `chaosdebug` is
+    used only to block reconcile.
   - S2b pass: no process of the old primary is left after lease expiry + 6s.
 - **PostgreSQL dies, agent lives (S1). Suspend + fence wait:**
   - After 3 failed probes the agent reports `Running=false`, and the leader
     commits `suspend_primary(epoch)`.
-  - The suspended agent stops renewing the lease and does not restart
-    PostgreSQL as primary until the leader commits `resume_primary(epoch)`.
+  - The suspended agent stops renewing the lease, sets
+    `restart_after_crash=off`, and does not restart PostgreSQL as primary.
+  - Heartbeat acks and `/peer/info` replies carry the leader's `suspended`
+    flag, and renewal needs "not suspended" from both the local FSM and the
+    leader.
+  - To resume, the leader commits `resume_primary(epoch)` (epoch unchanged,
+    no `set_primary`). The agent then checks quorum, writes a fresh lease,
+    and only then starts PostgreSQL as primary.
   - Promotion waits until `Q + lease_ttl + 0.5s + 2s` has passed since the
     suspension, or since the last heartbeat if the agent is silent. That is
     inside the 20s timeout, so RTO is unchanged.
   - The receipt's `fence_confirmed` records the wait.
-  - S1 includes a variant where PostgreSQL restarts at about 19s; it must
-    never accept writes after the suspension.
+  - S1 includes a variant where PostgreSQL restarts at about 19s. Pass: 0
+    writes accepted after the fence-wait deadline, and 0 acknowledged rows
+    lost or divergent.
 - **VIP when the agent is dead:**
   - The fence worker cannot remove the VIP (no NET_ADMIN), and we accept
     that. Safety comes from PostgreSQL being stopped by the lease, plus the
@@ -422,8 +432,8 @@ takes about 20h, run as a weekend batch.
 - Container image: the existing `testing/docker` multi-stage build, published
   to GitHub Container Registry on tag.
 - Release assets: static agent binaries plus checksums (the existing
-  procedure). deb/rpm and "install + join with a token" are deferred (premise
-  4 note).
+  procedure), plus deb/rpm packages built with nfpm and the install + join
+  wizard (working plan W10).
 - Public scorecard (E3, working plan W7): every nightly run, pass or fail, is
   published to a `scorecard` branch, with a badge and a 30-run table.
 - CI (GitHub Actions):
@@ -450,6 +460,7 @@ takes about 20h, run as a weekend batch.
 7. S9 rolling 1.2 → 1.3 upgrade with the version gate (W8).
 8. Nightly CI smoke and the public scorecard on the `scorecard` branch (W7).
 9. Record the deferred items in TODOS.md (W9).
+10. Install + join wizard: packages, `init`, join token, S11 (W10).
 
 ## The Assignment
 Run `contrib/worlber_ha/testing/lab.sh test` on your own machine this week.
