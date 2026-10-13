@@ -21,6 +21,7 @@
 #   LAB_FAILOVER_TIMEOUT   failover_timeout used by setup (default 10 seconds)
 #   LAB_CA_CERT            CA certificate for builds behind a TLS proxy
 #   LAB_BUILD_ARGS         extra "docker build" arguments (e.g. --network host)
+#   LAB_SKIP_BUILD         reuse an existing worlber-pg:lab image
 set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
@@ -82,10 +83,14 @@ wait_until() {
 }
 
 cmd_up() {
-    echo "== building image worlber-pg:lab (first build compiles PostgreSQL, takes a few minutes)"
-    # shellcheck disable=SC2086
-    docker build ${LAB_BUILD_ARGS:-} ${LAB_CA_CERT:+--secret id=ca,src=$LAB_CA_CERT} \
-        -f "$DIR/docker/Dockerfile" -t worlber-pg:lab "$ROOT"
+    if [ -n "${LAB_SKIP_BUILD:-}" ] && docker image inspect worlber-pg:lab >/dev/null 2>&1; then
+        echo "== using the existing image worlber-pg:lab (LAB_SKIP_BUILD)"
+    else
+        echo "== building image worlber-pg:lab (first build compiles PostgreSQL, takes a few minutes)"
+        # shellcheck disable=SC2086
+        docker build ${LAB_BUILD_ARGS:-} ${LAB_CA_CERT:+--secret id=ca,src=$LAB_CA_CERT} \
+            -f "$DIR/docker/Dockerfile" -t worlber-pg:lab "$ROOT"
+    fi
     dc up -d --no-build pg1 pg2 pg3
     for n in "${NODES[@]}"; do
         wait_until 60 "agent on $n is up" dc exec -T "$n" test -S /var/run/postgresql/.s.WORLBER_HA.5432

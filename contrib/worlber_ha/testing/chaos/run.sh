@@ -7,6 +7,8 @@
 #   s1   kill -9 the postmaster on the primary (agent alive)
 #   s2   kill -9 the agent on the primary (PostgreSQL alive, agent stays dead;
 #        needs the lab started with CHAOS_KEEP_PG=1)
+#   s3   freeze the whole primary node (docker pause) until the run ends
+#   s4   network partition of the primary until the run ends
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
 #
 # Every run writes results/<scenario>-<stamp>-<n>.json with the ledger verdict
@@ -30,6 +32,7 @@ LAB="$DIR/../lab.sh"
 COMPOSE="$DIR/../docker/docker-compose.yml"
 RESULTS="$DIR/results"
 NODES=(pg1 pg2 pg3)
+NET=worlber-lab-net
 declare -A IP=([pg1]=172.28.0.11 [pg2]=172.28.0.12 [pg3]=172.28.0.13)
 CLIENTS=${CHAOS_CLIENTS:-8}
 RATE=${CHAOS_RATE:-0}
@@ -86,14 +89,21 @@ ensure_lab() {
     if ! healthy; then
         log "lab not healthy: fresh lab (CHAOS_KEEP_PG=${CHAOS_KEEP_PG:-0})"
         "$LAB" down >/dev/null 2>&1 || true
-        "$LAB" up
+        LAB_SKIP_BUILD=1 "$LAB" up
         "$LAB" setup
         wait_until 180 healthy || { log "lab did not become healthy"; "$LAB" status || true; exit 2; }
     fi
 }
 
 restore() { # restore <node>: bring a faulted node back and wait for health
-    local node=$1
+    local node=$1 c
+    c=$(dc ps -q "$node")
+    if [ -n "$c" ] && [ "$(docker inspect -f '{{.State.Paused}}' "$c" 2>/dev/null)" = true ]; then
+        log "resuming $node"; docker unpause "$c" >/dev/null || true
+    fi
+    if [ -n "$c" ] && ! docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c" | grep -qw "$NET"; then
+        log "reconnecting $node"; docker network connect --ip "${IP[$node]}" "$NET" "$c" || true
+    fi
     # Only restart what the fault left broken: restarting a node that already
     # recovered (S1: the agent restarts PostgreSQL) would be a second fault.
     if healthy && dc exec -T "$node" pidof worlber-ha-agent >/dev/null 2>&1; then
@@ -149,6 +159,18 @@ dump_old_keys() {
     return $rc
 }
 
+# s3: freeze the whole primary node (all its processes) for CHAOS_PAUSE
+# seconds; it is resumed by restore after the verdict.
+fault_s3() {
+    docker pause "$(dc ps -q "$1")" >/dev/null || return 1
+    [ "$(docker inspect -f '{{.State.Paused}}' "$(dc ps -q "$1")")" = true ]
+}
+# s4: network partition of the primary; healed by restore after the verdict.
+fault_s4() {
+    docker network disconnect "$NET" "$(dc ps -q "$1")" || return 1
+    ! docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$(dc ps -q "$1")" | grep -qw "$NET"
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
     local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
@@ -196,10 +218,23 @@ run_one() { # run_one <scenario> <n> <stamp>
     # its data in isolation (unix socket only, read-only, fence off, no
     # agent: it died in S2) and dump the ledger keys.
     local old_args=() old_state=""
-    if [ "$sc" = s2 ] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
+    if [ "$sc" = s3 ]; then
+        # the frozen node can only be inspected after it is resumed; its
+        # fence worker must stop it at once (the lease clock kept running)
+        docker unpause "$(dc ps -q "$p")" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+    if [[ "$sc" =~ ^s[234]$ ]] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then
         if dc exec -T -u postgres "$p" pg_ctl -D /var/lib/postgresql/data status >/dev/null 2>&1; then
             old_state="running (not fenced)"
-            old_args=(--old-dsn "host=${IP[$p]} port=5432 connect_timeout=2 $AUTH")
+            if [ "$sc" = s4 ]; then
+                # partitioned: read it from inside its container
+                dc exec -T -u postgres "$p" psql -X -qAt -d postgres \
+                    -c "COPY (SELECT client, seq FROM worlber_ledger) TO STDOUT WITH CSV" >"$base.oldkeys" &&
+                    old_args=(--old-keys "$base.oldkeys")
+            else
+                old_args=(--old-dsn "host=${IP[$p]} port=5432 connect_timeout=2 $AUTH")
+            fi
         else
             old_state="stopped (fenced)"
             if dump_old_keys "$p" "$base.oldkeys"; then
@@ -238,7 +273,7 @@ run_one() { # run_one <scenario> <n> <stamp>
 
 sc=${1:-}
 runs=${2:-1}
-case "$sc" in s1|s2|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "$sc" in s1|s2|s3|s4|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)
 failed=0
