@@ -21,7 +21,7 @@ import (
 	"github.com/worlber/worlber-ha-agent/internal/pg"
 )
 
-var version = "1.0.0"
+var version = "1.2.0" // set by the release build: -ldflags "-X main.version=..."
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {

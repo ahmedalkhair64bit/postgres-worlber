@@ -1,0 +1,72 @@
+# Release build for worlber_ha: on a tag worlber-ha-vX.Y.Z, build static agent
+# binaries (amd64, arm64), .deb and .rpm packages (nfpm) and SHA256SUMS, and
+# attach them to the GitHub release for the tag.
+name: worlber_ha release
+
+on:
+  push:
+    tags: ['worlber-ha-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version to build (no release is published from a manual run)'
+        required: true
+        default: '0.0.0-dev'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach assets to the release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: contrib/worlber_ha/agent/go.mod
+          cache-dependency-path: contrib/worlber_ha/agent/go.sum
+      - name: Version
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#worlber-ha-v}"; else v="${{ inputs.version }}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Test
+        working-directory: contrib/worlber_ha/agent
+        run: go vet ./... && go test -race -count=1 ./...
+      - name: Build binaries
+        working-directory: contrib/worlber_ha/agent
+        run: |
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${{ steps.v.outputs.version }}" \
+              -o ../packaging/dist/worlber-ha-agent-$arch ./cmd/worlber-ha-agent
+          done
+      - name: Packages (nfpm)
+        working-directory: contrib/worlber_ha/packaging
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+          for arch in amd64 arm64; do
+            for fmt in deb rpm; do
+              VERSION=${{ steps.v.outputs.version }} ARCH=$arch "$(go env GOPATH)/bin/nfpm" pkg -f nfpm.yaml -p $fmt -t dist/
+            done
+          done
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Smoke test the .deb
+        working-directory: contrib/worlber_ha/packaging/dist
+        run: |
+          sudo dpkg -i worlber-ha-agent_*_amd64.deb
+          worlber-ha-agent --version | grep -F "${{ steps.v.outputs.version }}"
+          sudo dpkg -r worlber-ha-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worlber-ha-agent-${{ steps.v.outputs.version }}
+          path: contrib/worlber_ha/packaging/dist/
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "worlber_ha ${{ steps.v.outputs.version }}" --notes "worlber_ha agent ${{ steps.v.outputs.version }}"
+          gh release upload "$GITHUB_REF_NAME" contrib/worlber_ha/packaging/dist/* --clobber

@@ -1,0 +1,37 @@
+# nfpm config for the worlber-ha-agent .deb / .rpm.
+#   VERSION=1.2.0 ARCH=amd64 nfpm pkg -f nfpm.yaml -p deb -t dist/
+name: worlber-ha-agent
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: database
+priority: optional
+maintainer: Worlber <noreply@worlber.invalid>
+description: |
+  worlber_ha node agent: high availability for PostgreSQL managed from SQL
+  (embedded Raft, fencing lease, listener, VIP). Install on every node, then
+  manage the cluster with CREATE EXTENSION worlber_ha.
+vendor: Worlber
+homepage: https://github.com/ahmedalkhair64bit/postgres-worlber
+license: PostgreSQL
+contents:
+  - src: ./dist/worlber-ha-agent-${ARCH}
+    dst: /usr/bin/worlber-ha-agent
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ./pkg/worlber-ha-agent.service
+    dst: /lib/systemd/system/worlber-ha-agent.service
+    file_info:
+      mode: 0644
+  - src: ./pkg/agent.env.example
+    dst: /etc/worlber_ha/agent.env.example
+    type: config|noreplace
+    file_info:
+      mode: 0640
+  - src: ./role-change-gcp-alias-ip.sh
+    dst: /usr/share/worlber-ha-agent/role-change-gcp-alias-ip.sh
+    file_info:
+      mode: 0755
+scripts:
+  postinstall: ./pkg/postinstall.sh

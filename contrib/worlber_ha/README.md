@@ -94,7 +94,21 @@ in Raft but has no PostgreSQL, like a SQL Server file share witness.
 
 ## Installation
 
-Build PostgreSQL with this contrib module as usual, then build the agent (it
+**From packages (agent):** each release attaches `.deb` and `.rpm` packages
+(amd64, arm64) and `SHA256SUMS`. A new node then needs only a few steps:
+
+```sh
+sudo apt install ./worlber-ha-agent_1.2.0_amd64.deb      # or: sudo dnf install ./worlber-ha-agent-1.2.0-1.x86_64.rpm
+# on any member, in psql:  SELECT worlber_ha.join_token();   -> save to token.txt
+sudo -u postgres worlber-ha-agent init --join-file token.txt --pgdata /var/lib/pgsql/data
+sudo systemctl enable --now worlber-ha-agent
+# on any member, in psql:  SELECT worlber_ha.add_node('<this host>');
+```
+
+The package installs `/usr/bin/worlber-ha-agent`, the systemd unit and an
+example `/etc/worlber_ha/agent.env`. It never starts the service by itself.
+
+**From source:** Build PostgreSQL with this contrib module as usual, then build the agent (it
 needs Go 1.24 or newer):
 
 ```sh
