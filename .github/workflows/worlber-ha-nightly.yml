@@ -1,0 +1,79 @@
+# Nightly public scorecard for worlber_ha (W7).
+#
+# Runs the chaos smoke on a GitHub-hosted runner (Docker lab, 3 nodes), then
+# publishes EVERY run, pass or fail, to the `scorecard` branch:
+#   results/<date>-<sha>.json   one entry per night
+#   latest.json                 shields.io endpoint badge
+#   SCORECARD.md                the last 30 runs
+# The job never commits to master.  Scheduled workflows only run from the
+# default branch, so this file must be merged to master to start.
+name: worlber_ha nightly scorecard
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worlber-ha-scorecard
+  cancel-in-progress: false
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write   # push to the scorecard branch only
+    env:
+      CHAOS_KEEP_PG: '1'          # S2 needs PostgreSQL to outlive its agent
+      LAB_FAILOVER_TIMEOUT: '10'
+      CHAOS_CLIENTS: '8'
+      RUNS: '3'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: contrib/worlber_ha/agent/go.mod
+          cache-dependency-path: contrib/worlber_ha/agent/go.sum
+      - name: Start the lab
+        working-directory: contrib/worlber_ha/testing
+        run: ./lab.sh up && ./lab.sh setup
+      - name: Chaos smoke (S1, S2, S4, S11, S12)
+        id: chaos
+        working-directory: contrib/worlber_ha/testing
+        run: |
+          rc=0
+          for sc in s1 s2 s4 s11 s12; do
+            CHAOS_TAIL=60 ./chaos/run.sh "$sc" "$RUNS" || rc=1
+          done
+          exit $rc
+      - name: Build the scorecard entry
+        if: always()
+        working-directory: contrib/worlber_ha/testing
+        run: |
+          mkdir -p "$RUNNER_TEMP/sc"
+          if ls chaos/results/*.json >/dev/null 2>&1; then
+            ./chaos/report.sh chaos/results > "$RUNNER_TEMP/sc/entry.json"
+          else
+            jq -n --arg d "$(date -u +%FT%TZ)" '{date: $d, scenarios: {}, pass: false, error: "job failed before any result"}' > "$RUNNER_TEMP/sc/entry.json"
+          fi
+          jq --arg sha "${GITHUB_SHA::7}" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+             --arg outcome "${{ steps.chaos.outcome }}" \
+             '. + {commit: $sha, run_url: $run, runner: "github ubuntu-latest", runs_per_scenario: (env.RUNS | tonumber), job_outcome: $outcome}' \
+             "$RUNNER_TEMP/sc/entry.json" > "$RUNNER_TEMP/sc/entry2.json"
+          cat "$RUNNER_TEMP/sc/entry2.json"
+      - name: Publish to the scorecard branch
+        if: always()
+        run: contrib/worlber_ha/testing/chaos/publish-scorecard.sh "$RUNNER_TEMP/sc/entry2.json" .
+      - name: Upload lab results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-results
+          path: contrib/worlber_ha/testing/chaos/results/
+          if-no-files-found: ignore
