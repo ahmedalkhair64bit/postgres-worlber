@@ -35,8 +35,8 @@
 #   CHAOS_SOAK      s7 duration (default 30m)
 #   CHAOS_REPORTS   report sessions on the read-only listener (default 2)
 #   CHAOS_S7_ARCHIVE  s7 with the WAL archive on (default 1)
-#   CHAOS_S7_WAL_MBS  s7 extra WAL rate in MB/s during the soak (default 2)
-#   CHAOS_S7_BURST    s7 unthrottled WAL burst before the soak, seconds (default 30)
+#   CHAOS_S7_WAL_MBS  s7 extra WAL rate in MB/s during the soak (default 1)
+#   CHAOS_S7_BURST    s7 unthrottled WAL burst before the soak, seconds (default 10)
 #   LEDGER          worlber-ledger binary (default: built from the agent module)
 set -euo pipefail
 
@@ -299,7 +299,7 @@ s7_sampler() {
 # with a known WAL rate for the whole soak.  Bounded so 30 minutes fit the
 # lab disk (the archive keeps archive_keep = 7d).
 s7_walgen() {
-    local end=$((SECONDS + $1)) mbs=${CHAOS_S7_WAL_MBS:-2} p t0
+    local end=$((SECONDS + $1)) mbs=${CHAOS_S7_WAL_MBS:-1} p t0
     [ "$mbs" -gt 0 ] || return 0
     while (( SECONDS < end )); do
         t0=$(now_ms)
@@ -333,14 +333,19 @@ s7_burst() {
 }
 # s7_archive_summary <file>: D14 numbers from the samples.
 s7_archive_summary() {
-    awk 'NF==5 { n++; t[n]=$1; w[n]=$2; a[n]=$3; f[n]=$4; r[n]=$5; if ($5>maxr) maxr=$5 }
+    awk 'NF==5 { n++; t[n]=$1; w[n]=$2; a[n]=$3; f[n]=$4; r[n]=$5; if ($5>maxr) maxr=$5
+            # counters restart from 0 when PostgreSQL restarts: count the
+            # restarts and sum only forward steps
+            if (n>1) { if ($3>=a[n-1]) da+=$3-a[n-1]; else { resets++; da+=$3 }
+                       if ($4>=f[n-1]) df+=$4-f[n-1]; else df+=$4
+                       if ($2>=w[n-1]) dw+=$2-w[n-1] } }
         END {
             if (n < 2) { print "{\"samples\":" n "}"; exit }
             d=t[n]-t[1]; if (d<1) d=1
             third=int(n/3); if (third<1) third=1
             for (i=1;i<=third;i++) first+=r[i]; for (i=n-third+1;i<=n;i++) last+=r[i]
-            printf "{\"samples\":%d,\"seconds\":%d,\"wal_mb_s\":%.2f,\"archive_mb_s\":%.2f,\"archived_segments\":%d,\"archive_failures\":%d,\"ready_max\":%d,\"ready_first_third_avg\":%.1f,\"ready_last_third_avg\":%.1f,\"ready_final\":%d}\n",
-                n, d, (w[n]-w[1])/1048576/d, (a[n]-a[1])*16/d, a[n]-a[1], f[n]-f[1], maxr, first/third, last/third, r[n]
+            printf "{\"samples\":%d,\"seconds\":%d,\"wal_mb_s\":%.2f,\"archive_mb_s\":%.2f,\"archived_segments\":%d,\"archive_failures\":%d,\"pg_restarts\":%d,\"ready_max\":%d,\"ready_first_third_avg\":%.1f,\"ready_last_third_avg\":%.1f,\"ready_final\":%d}\n",
+                n, d, dw/1048576/d, da*16/d, da, df, resets+0, maxr, first/third, last/third, r[n]
         }' "$1"
 }
 
@@ -356,10 +361,18 @@ run_one() { # run_one <scenario> <n> <stamp>
     if [ "$sc" = s7 ]; then
         dur=$SOAK
         if [ "${CHAOS_S7_ARCHIVE:-1}" = 1 ]; then s7_archive_on || return 1; fi
+        local free_gb; free_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+        if (( free_gb < ${CHAOS_S7_MIN_FREE_GB:-8} )); then
+            log "s7: only ${free_gb}G free on the docker host; the soak with the archive needs ${CHAOS_S7_MIN_FREE_GB:-8}G"; return 1
+        fi
         latency=$(s7_latency "$base" | tail -1)
         burst='null'
-        if [ "${CHAOS_S7_BURST:-30}" -gt 0 ] && [ "${CHAOS_S7_ARCHIVE:-1}" = 1 ]; then
-            burst=$(s7_burst "${CHAOS_S7_BURST:-30}")
+        if [ "${CHAOS_S7_BURST:-10}" -gt 0 ] && [ "${CHAOS_S7_ARCHIVE:-1}" = 1 ]; then
+            burst=$(s7_burst "${CHAOS_S7_BURST:-10}")
+            # the burst segments are only a measurement: drop them so the
+            # soak does not start with GBs in the archive (replicas stream)
+            sql "$(primary)" "CHECKPOINT" >/dev/null
+            dc exec -T -u postgres "$(primary)" bash -c "find /mnt/wal-archive -type f -mmin -5 -delete" || true
             log "s7: archive burst (D14 ceiling): $(jq -c . <<<"$burst")"
         fi
         "$LEDGER" setup --dsn "$RW_DSN" --reset
@@ -464,7 +477,7 @@ run_one() { # run_one <scenario> <n> <stamp>
     local blocked=0
     blocked=$(jq '[.[] | select(.kind == "failover_blocked")] | length' <<<"$events")
     pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" --argjson blk "$blocked" --argjson healed "$healed_s" --argjson arch "$archive" '
-        if $sc == "s7" then ($v.pass == true and $fo == 0 and ($arch == null or (($arch.archive_failures // 0) == 0 and ($arch.ready_final // 0) <= 8)))
+        if $sc == "s7" then ($v.pass == true and $fo == 0 and ($arch == null or (($arch.archive_failures // 0) == 0 and ($arch.pg_restarts // 0) == 0 and ($arch.ready_final // 0) <= 8)))
         elif $sc == "s5" then ($fo == 0 and $v.pass == true)
         elif ($sc == "s11" or $sc == "s12") then ($v.pass == true and $healed >= 0)
         else ($v.pass == true and ($v.summary.rto_ms // -1) >= 0 and ($v.summary.rto_ms // -1) <= $max)
