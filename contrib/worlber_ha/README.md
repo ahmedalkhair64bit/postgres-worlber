@@ -78,6 +78,16 @@ that just died, failover would die with it.
   `pg_rewind`, or re-seeded if the rewind fails (the old directory is kept as
   `PGDATA.worlber_ha_diverged.<time>`), and then joins as a standby.
 
+* **Whole-cluster outages heal by themselves.**
+  * **Power loss of every node:** when the nodes come back, Raft elects a
+    leader and the same primary resumes. Measured in the lab: 3/3 runs, no
+    manual step, 0 acknowledged rows lost, writes back about 4 s after the
+    nodes are up.
+  * **Network failure between all nodes:** no node has a majority, so the
+    primary stops itself within the lease TTL instead of accepting writes
+    alone. When the network is back it is confirmed again and restarts as
+    primary. Measured: 3/3 runs, no failover, 0 acknowledged rows lost.
+
 A cluster needs **at least three agents** to survive the loss of one node. With
 two database servers, add a third agent as a **witness** (`--witness`). It votes
 in Raft but has no PostgreSQL, like a SQL Server file share witness.

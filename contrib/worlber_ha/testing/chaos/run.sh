@@ -15,6 +15,8 @@
 #   s5   kill the sync standby, then the primary; must block (async_failover never)
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
 #   s10  WAL archive catch-up: offline replica recovers from the archive
+#   s11  full power loss: kill all nodes, start them again, must self-heal
+#   s12  network failure between all nodes, then recovery, must self-heal
 #
 # Every run writes results/<scenario>-<stamp>-<n>.json with the ledger verdict
 # (acked rows missing, acked rows only on the old primary, RTO), the events
@@ -222,6 +224,30 @@ fault_s5() {
     ! running "$1"
 }
 
+# s11: full power loss.  Kill every node at once (SIGKILL, no shutdown), keep
+# them down CHAOS_DOWN seconds, then start them all; nobody intervenes.
+# Note: docker kill does not drop the host page cache, so this tests restart
+# and self-healing, not fsync durability against a real power cut (that is
+# PostgreSQL's own guarantee with fsync=on).
+fault_s11() {
+    dc kill pg1 pg2 pg3 >/dev/null || return 1
+    ( sleep "${CHAOS_DOWN:-20}"; dc start pg1 pg2 pg3 >/dev/null 2>&1 ) &
+    ! running pg1 && ! running pg2 && ! running pg3
+}
+# s12: network failure between all nodes.  Disconnect every node from the lab
+# network for CHAOS_DOWN seconds (no majority anywhere), then reconnect.
+fault_s12() {
+    local n
+    for n in pg1 pg2 pg3; do
+        docker network disconnect "$NET" "$(dc ps -q "$n")" || return 1
+    done
+    ( sleep "${CHAOS_DOWN:-30}"
+      for n in pg1 pg2 pg3; do
+          docker network connect --ip "${IP[$n]}" "$NET" "$(dc ps -q "$n")" >/dev/null 2>&1
+      done ) &
+    return 0
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
     local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
@@ -263,6 +289,12 @@ run_one() { # run_one <scenario> <n> <stamp>
     wait "$writer" || true
     [ -n "$reporter" ] && { wait "$reporter" || true; }
 
+    local healed_s=-1
+    if [[ "$sc" =~ ^(s11|s12)$ ]]; then
+        local h0=$SECONDS
+        if wait_until 300 healthy; then healed_s=$(( SECONDS - h0 )); fi
+        log "$sc run $n: cluster healthy again by itself: $([ $healed_s -ge 0 ] && echo "yes (${healed_s}s after the load ended)" || echo NO)"
+    fi
     newp=$(primary)
     # S2: rows on the old primary that are not on the new primary must never
     # be acknowledged.  If fencing already stopped the old primary, start
@@ -315,9 +347,10 @@ run_one() { # run_one <scenario> <n> <stamp>
 
     local blocked=0
     blocked=$(jq '[.[] | select(.kind == "failover_blocked")] | length' <<<"$events")
-    pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" --argjson blk "$blocked" '
+    pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" --argjson blk "$blocked" --argjson healed "$healed_s" '
         if $sc == "s7" then ($v.pass == true and $fo == 0)
         elif $sc == "s5" then ($fo == 0 and $v.pass == true)
+        elif ($sc == "s11" or $sc == "s12") then ($v.pass == true and $healed >= 0)
         else ($v.pass == true and ($v.summary.rto_ms // -1) >= 0 and ($v.summary.rto_ms // -1) <= $max)
         end')
     jq -n --arg sc "$sc" --argjson n "$n" --arg old "$p" --arg new "${newp:-}" \
@@ -431,7 +464,7 @@ sc=${1:-}
 runs=${2:-1}
 if [ "$sc" = s10 ]; then cmd_s10; exit $?; fi
 if [ "$sc" = _streaming ]; then anysql "SELECT state FROM worlber_ha.cluster_status WHERE node='$2'"; exit 0; fi
-case "$sc" in s1|s1late|s2|s2b|s3|s4|s5|s7) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
+case "$sc" in s1|s1late|s2|s2b|s3|s4|s5|s7|s11|s12) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)
 failed=0
