@@ -47,12 +47,13 @@ jq -n --arg m "$msg" --arg c "$color" '{schemaVersion: 1, label: "worlber_ha cha
     echo "runner (Docker lab, 3 nodes, failover_timeout 10s, 8 writer clients). RTO is the"
     echo "maximum over the runs. Last update: $(date -u +%F)."
     echo
-    echo "| date | commit | pass | S1 RTO | S2 RTO | S4 RTO | S11 RTO | S12 RTO | acked rows lost |"
-    echo "|---|---|---|---|---|---|---|---|---|"
+    echo "| date | commit | pass | S1 RTO | S2 RTO | S4 RTO | S11 RTO | S12 RTO | S9 upgrade | acked rows lost |"
+    echo "|---|---|---|---|---|---|---|---|---|---|"
     for f in $(ls results/*.json | sort -r | head -30); do
         jq -r '
           def r(k): (.scenarios[k].max_rto_ms // null) | if . == null then "-" else "\((. / 100 | floor) / 10)s" end;
-          "| \(.date[0:10]) | \(.commit) | \(if .pass then "yes" else "**no**" end) | \(r("s1")) | \(r("s2")) | \(r("s4")) | \(r("s11")) | \(r("s12")) | \([.scenarios[] | .acked_missing] | add // 0) |"' "$f"
+          def u: (.scenarios.s9 // null) | if . == null then "-" else "\(.passed)/\(.runs)" end;
+          "| \(.date[0:10]) | \(.commit) | \(if .pass then "yes" else "**no**" end) | \(r("s1")) | \(r("s2")) | \(r("s4")) | \(r("s11")) | \(r("s12")) | \(u) | \([.scenarios[] | .acked_missing] | add // 0) |"' "$f"
     done
 } > SCORECARD.md
 

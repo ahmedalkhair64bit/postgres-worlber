@@ -34,6 +34,9 @@
 #   CHAOS_RTO_MAX   pass bar for RTO in ms (default 30000)
 #   CHAOS_SOAK      s7 duration (default 30m)
 #   CHAOS_REPORTS   report sessions on the read-only listener (default 2)
+#   CHAOS_S7_ARCHIVE  s7 with the WAL archive on (default 1)
+#   CHAOS_S7_WAL_MBS  s7 extra WAL rate in MB/s during the soak (default 2)
+#   CHAOS_S7_BURST    s7 unthrottled WAL burst before the soak, seconds (default 30)
 #   LEDGER          worlber-ledger binary (default: built from the agent module)
 set -euo pipefail
 
@@ -251,6 +254,96 @@ fault_s12() {
     return 0
 }
 
+
+# --- S7 measurements (D14, P7) ---------------------------------------------
+# s7_archive_on: enable the shared WAL archive (needs a restart of every node
+# for archive_mode) so the soak measures archive throughput.
+s7_archive_on() {
+    local p; p=$(primary)
+    [ "$(sql "$p" "SHOW archive_mode")" = on ] && return 0
+    log "s7: enabling the WAL archive (rolling restart of the lab)"
+    dc exec -T -u postgres "$p" bash -c "rm -f /mnt/wal-archive/* 2>/dev/null || true"
+    sql "$p" "SELECT worlber_ha.set_config('wal_archive_dir', '/mnt/wal-archive')" >/dev/null
+    dc restart pg1 pg2 pg3 >/dev/null
+    wait_until 240 healthy || { log "s7: cluster not healthy after enabling the archive"; return 1; }
+}
+# s7_latency <base>: P7, 60s of ledger writes through the listener, then 60s
+# direct to the primary; prints {listener:{...}, direct:{...}} with tps/p50/p99.
+s7_latency() {
+    local base=$1 p mode dsn out='{}' v secs=${CHAOS_S7_LAT_SECS:-60}
+    p=$(primary)
+    for mode in listener direct; do
+        if [ $mode = listener ]; then dsn=$RW_DSN; else dsn="host=${IP[$p]} port=5432 connect_timeout=1 $AUTH"; fi
+        "$LEDGER" setup --dsn "$RW_DSN" --reset >/dev/null
+        "$LEDGER" write --dsn "$dsn" --clients "$CLIENTS" --rate "$RATE" --duration "${secs}s" --out "$base.lat-$mode.ledger" 2>/dev/null || true
+        v=$("$LEDGER" verify --ledger "$base.lat-$mode.ledger" --dsn "host=${IP[$p]} port=5432 connect_timeout=2 $AUTH" || echo '{}')
+        out=$(jq --arg m $mode --argjson v "$v" --argjson s "$secs" \
+            '. + {($m): {tps: (($v.summary.acked // 0) / $s | floor), ack_p50_ms: $v.summary.ack_p50_ms, ack_p99_ms: $v.summary.ack_p99_ms}}' <<<"$out")
+    done
+    log "s7: latency (P7): $(jq -c . <<<"$out")" >&2
+    printf '%s\n' "$out"
+}
+# s7_sampler <file> <seconds>: every 30s on the primary, record time, WAL
+# position, archived segments and segments waiting to be archived (.ready).
+s7_sampler() {
+    local f=$1 end=$((SECONDS + $2)) p
+    : >"$f"
+    while (( SECONDS < end )); do
+        p=$(primary)
+        [ -n "$p" ] && sql "$p" "SELECT extract(epoch FROM now())::bigint, pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, archived_count, failed_count, (SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready') FROM pg_stat_archiver" 2>/dev/null | tr '|' ' ' >>"$f" || true
+        sleep 30
+    done
+}
+# s7_walgen <seconds>: steady extra WAL on the primary during the soak
+# (CHAOS_S7_WAL_MBS MB/s, default 2, 0 = off), so the archive must keep up
+# with a known WAL rate for the whole soak.  Bounded so 30 minutes fit the
+# lab disk (the archive keeps archive_keep = 7d).
+s7_walgen() {
+    local end=$((SECONDS + $1)) mbs=${CHAOS_S7_WAL_MBS:-2} p t0
+    [ "$mbs" -gt 0 ] || return 0
+    while (( SECONDS < end )); do
+        t0=$(now_ms)
+        p=$(primary)
+        [ -n "$p" ] && sql "$p" "SELECT count(pg_logical_emit_message(false, 's7', repeat(md5(g::text), 32768))) FROM generate_series(1, $mbs) g" >/dev/null 2>&1
+        local left=$(( 1000 - ($(now_ms) - t0) ))
+        (( left > 0 )) && sleep "0.$(printf '%03d' "$left")"
+    done
+}
+# s7_burst <seconds>: D14 ceiling.  Unthrottled WAL for a short burst; prints
+# WAL MB/s, archive MB/s during the burst, and how long the backlog took to
+# drain afterwards.
+s7_burst() {
+    local secs=${1:-30} p a0 a1 w0 w1 t0 t1 ready drain=-1 s
+    p=$(primary)
+    read -r w0 a0 <<<"$(sql "$p" "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, archived_count FROM pg_stat_archiver" | tr '|' ' ')"
+    t0=$(date +%s)
+    while (( $(date +%s) - t0 < secs )); do
+        sql "$p" "SELECT count(pg_logical_emit_message(false, 's7b', repeat(md5(g::text), 32768))) FROM generate_series(1, 64) g" >/dev/null
+    done
+    read -r w1 a1 <<<"$(sql "$p" "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, archived_count FROM pg_stat_archiver" | tr '|' ' ')"
+    t1=$(date +%s)
+    ready=$(sql "$p" "SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'")
+    for s in $(seq 0 600); do
+        [ "$(sql "$p" "SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'")" -le 1 ] && { drain=$s; break; }
+        sleep 1
+    done
+    jq -n --argjson d $((t1 - t0)) --argjson w $((w1 - w0)) --argjson a $((a1 - a0)) --argjson r "$ready" --argjson drain "$drain" \
+        '{seconds: $d, wal_mb_s: (($w / 1048576 / $d) * 10 | floor / 10), archive_mb_s: (($a * 16 / $d) * 10 | floor / 10),
+          ready_after_burst: $r, drain_s: $drain, archive_type: "local docker volume"}'
+}
+# s7_archive_summary <file>: D14 numbers from the samples.
+s7_archive_summary() {
+    awk 'NF==5 { n++; t[n]=$1; w[n]=$2; a[n]=$3; f[n]=$4; r[n]=$5; if ($5>maxr) maxr=$5 }
+        END {
+            if (n < 2) { print "{\"samples\":" n "}"; exit }
+            d=t[n]-t[1]; if (d<1) d=1
+            third=int(n/3); if (third<1) third=1
+            for (i=1;i<=third;i++) first+=r[i]; for (i=n-third+1;i<=n;i++) last+=r[i]
+            printf "{\"samples\":%d,\"seconds\":%d,\"wal_mb_s\":%.2f,\"archive_mb_s\":%.2f,\"archived_segments\":%d,\"archive_failures\":%d,\"ready_max\":%d,\"ready_first_third_avg\":%.1f,\"ready_last_third_avg\":%.1f,\"ready_final\":%d}\n",
+                n, d, (w[n]-w[1])/1048576/d, (a[n]-a[1])*16/d, a[n]-a[1], f[n]-f[1], maxr, first/third, last/third, r[n]
+        }' "$1"
+}
+
 run_one() { # run_one <scenario> <n> <stamp>
     local sc=$1 n=$2 stamp=$3 p fault_at=0 dur verify newp failovers events pass
     local base="$RESULTS/$sc-$stamp-$n"
@@ -259,8 +352,22 @@ run_one() { # run_one <scenario> <n> <stamp>
     log "$sc run $n: primary is $p"
     "$LEDGER" setup --dsn "$RW_DSN" --reset
 
+    local latency='null' sampler="" walgen="" burst='null'
     if [ "$sc" = s7 ]; then
         dur=$SOAK
+        if [ "${CHAOS_S7_ARCHIVE:-1}" = 1 ]; then s7_archive_on || return 1; fi
+        latency=$(s7_latency "$base" | tail -1)
+        burst='null'
+        if [ "${CHAOS_S7_BURST:-30}" -gt 0 ] && [ "${CHAOS_S7_ARCHIVE:-1}" = 1 ]; then
+            burst=$(s7_burst "${CHAOS_S7_BURST:-30}")
+            log "s7: archive burst (D14 ceiling): $(jq -c . <<<"$burst")"
+        fi
+        "$LEDGER" setup --dsn "$RW_DSN" --reset
+        local soak_s; soak_s=$(( $(sed -E 's/([0-9]+)m$/\1*60/; s/([0-9]+)s$/\1/; s/([0-9]+)h$/\1*3600/' <<<"$SOAK") ))
+        s7_sampler "$base.archive" "$soak_s" &
+        sampler=$!
+        s7_walgen "$soak_s" &
+        walgen=$!
     else
         dur="$((WARMUP + TAIL))s"
     fi
@@ -291,6 +398,12 @@ run_one() { # run_one <scenario> <n> <stamp>
     fi
     wait "$writer" || true
     [ -n "$reporter" ] && { wait "$reporter" || true; }
+    local archive='null'
+    if [ -n "$sampler" ]; then
+        kill "$sampler" $walgen 2>/dev/null || true; wait "$sampler" $walgen 2>/dev/null || true
+        archive=$(s7_archive_summary "$base.archive")
+        log "s7: archive (D14): $archive"
+    fi
 
     local healed_s=-1
     if [[ "$sc" =~ ^(s11|s12)$ ]]; then
@@ -350,8 +463,8 @@ run_one() { # run_one <scenario> <n> <stamp>
 
     local blocked=0
     blocked=$(jq '[.[] | select(.kind == "failover_blocked")] | length' <<<"$events")
-    pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" --argjson blk "$blocked" --argjson healed "$healed_s" '
-        if $sc == "s7" then ($v.pass == true and $fo == 0)
+    pass=$(jq -n --argjson v "$verify" --arg sc "$sc" --argjson fo "$failovers" --argjson max "$RTO_MAX" --argjson blk "$blocked" --argjson healed "$healed_s" --argjson arch "$archive" '
+        if $sc == "s7" then ($v.pass == true and $fo == 0 and ($arch == null or (($arch.archive_failures // 0) == 0 and ($arch.ready_final // 0) <= 8)))
         elif $sc == "s5" then ($fo == 0 and $v.pass == true)
         elif ($sc == "s11" or $sc == "s12") then ($v.pass == true and $healed >= 0)
         else ($v.pass == true and ($v.summary.rto_ms // -1) >= 0 and ($v.summary.rto_ms // -1) <= $max)
@@ -359,10 +472,10 @@ run_one() { # run_one <scenario> <n> <stamp>
     jq -n --arg sc "$sc" --argjson n "$n" --arg old "$p" --arg new "${newp:-}" \
         --argjson fault_at "$fault_at" --argjson clients "$CLIENTS" --argjson rate "$RATE" \
         --argjson v "$verify" --argjson ev "$events" --argjson fo "$failovers" \
-        --argjson reports "$reports" --argjson pass "$pass" --arg old_checked "${old_args[*]:+yes}" --arg old_state "$old_state" \
+        --argjson reports "$reports" --argjson pass "$pass" --argjson latency "$latency" --argjson archive "$archive" --argjson burst "$burst" --arg old_checked "${old_args[*]:+yes}" --arg old_state "$old_state" \
         '{scenario: $sc, run: $n, old_primary: $old, new_primary: $new, fault_at_ms: $fault_at,
           clients: $clients, rate_per_client: $rate, automatic_failovers: $fo,
-          old_primary_checked: ($old_checked == "yes"), old_primary_state: $old_state, verdict: $v, reports: $reports,
+          old_primary_checked: ($old_checked == "yes"), old_primary_state: $old_state, verdict: $v, reports: $reports, latency: $latency, archive: $archive, archive_burst: $burst,
           events: $ev, pass: $pass}' >"$base.json"
     log "$sc run $n: pass=$pass old=$p new=${newp:-none} rto_ms=$(jq '.summary.rto_ms // null' <<<"$verify") acked=$(jq '.acked // 0' <<<"$verify") missing=$(jq '.acked_missing // null' <<<"$verify") old_only_acked=$(jq '.old_only_acked // null' <<<"$verify") failovers=$failovers${old_state:+ old_primary=$old_state}"
     if [ "$sc" = s2b ] && [ -n "$newp" ] && [ "$newp" != "$p" ]; then

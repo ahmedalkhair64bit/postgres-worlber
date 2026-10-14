@@ -119,7 +119,7 @@ CHAOS_SOAK=30m ./chaos/run.sh s7        # no fault: false failovers, report canc
 | s10 | `./chaos/run.sh s10`: archive on, a replica stopped, ~320 MB of WAL written so its slot is invalidated (`lost`), replica started again | replica catches up from the archive with no re-seed, `verify_table` matches |
 | s11 | full power loss: `docker kill` all three nodes, start them again after `CHAOS_DOWN` s (20) | cluster healthy again with no manual action, 0 acked rows missing |
 | s12 | network cut between all nodes for `CHAOS_DOWN` s (30), then reconnected | primary fences itself (no majority), cluster healthy again with no manual action, 0 acked rows missing |
-| s7 | none, for `CHAOS_SOAK`; long reports on port 5001 | 0 acked rows missing, 0 automatic failovers |
+| s7 | none, for `CHAOS_SOAK`; long reports on port 5001. First enables the WAL archive, measures listener vs direct latency (60s each, P7) and a 30s unthrottled WAL burst (archive ceiling, D14); during the soak adds `CHAOS_S7_WAL_MBS` MB/s of WAL and samples the archiver every 30s | 0 acked rows missing, 0 automatic failovers, 0 archive failures, archiver backlog (`.ready` segments) at the end ≤ 8 |
 
 Each run writes `chaos/results/<scenario>-<stamp>-<n>.json`. It holds the
 ledger verdict (`acked`, `acked_missing`, `old_only_acked`, `rto_ms`, ack
