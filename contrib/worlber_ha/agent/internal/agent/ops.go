@@ -665,20 +665,23 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 
 // nodeStatus is one row of worlber_ha.cluster_status.
 type nodeStatus struct {
-	Node       string `json:"node"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	Role       string `json:"role"`
-	State      string `json:"state"`
-	Timeline   int    `json:"timeline"`
-	LSN        string `json:"lsn,omitempty"`
-	ReplayLSN  string `json:"replay_lsn,omitempty"`
-	LagBytes   *int64 `json:"lag_bytes"`
-	Sync       bool   `json:"sync"`
-	SyncState  string `json:"sync_state"`
-	RaftRole   string `json:"raft_role"`
-	LastSeenMs *int64 `json:"last_seen_ms"`
-	Agent      string `json:"agent_status"`
+	Node       string      `json:"node"`
+	Host       string      `json:"host"`
+	Port       int         `json:"port"`
+	Role       string      `json:"role"`
+	State      string      `json:"state"`
+	Timeline   int         `json:"timeline"`
+	LSN        string      `json:"lsn,omitempty"`
+	ReplayLSN  string      `json:"replay_lsn,omitempty"`
+	LagBytes   *int64      `json:"lag_bytes"`
+	Sync       bool        `json:"sync"`
+	SyncState  string      `json:"sync_state"`
+	RaftRole   string      `json:"raft_role"`
+	LastSeenMs *int64      `json:"last_seen_ms"`
+	Agent      string      `json:"agent_status"`
+	Fence      string      `json:"fence_state,omitempty"`
+	LeaseAge   *float64    `json:"lease_age_s,omitempty"`
+	Archive    *archiveRow `json:"archive,omitempty"`
 }
 
 func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
@@ -717,6 +720,9 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 			ns.LastSeenMs = &ms
 		}
 		ns.Agent = hb.Status
+		if fresh {
+			ns.Fence, ns.LeaseAge, ns.Archive = hb.Fence, hb.LeaseAge, hb.Archive
+		}
 		h := hb.Health
 		switch {
 		case n.Witness:

@@ -394,6 +394,78 @@ Typical sequence of `events` during an automatic failover and rejoin:
 `vip_acquired` → `repointed` (other standbys) → later, on the old primary,
 `demoted` or `rejoin_started` → `rewind_completed` → `standby_started`.
 
+### New columns in `cluster_status`
+
+| column | meaning |
+|---|---|
+| `fence_state` | `armed` = the fence worker protects this node; `inactive` = `worlber_ha` is not in `shared_preload_libraries` (only the agent can fence); `gate_closed` = a rolling upgrade is in progress; `expired` = this node's lease ran out (it is being, or was, stopped) |
+| `lease_age_s` | age in seconds of the last lease this node wrote; on a healthy primary it stays below the lease TTL (`failover_timeout / 3`) |
+| `archive_failing` | on the primary: the last attempt to archive a WAL segment failed |
+| `last_archived` | on the primary: time since the last WAL segment was archived |
+
+## Runbooks
+
+Each entry: what you see, what it means, what to do.
+
+**Primary fenced (`fenced` / `fence_killed` events, `fence_state = expired`)**
+* Meaning: the primary could not confirm with the cluster that it is still
+  the primary (it lost the majority, or its agent died), so it stopped
+  itself before another node could be promoted. This is the protection
+  working, not a fault in it.
+* Check: `SELECT * FROM worlber_ha.events LIMIT 20` shows whether a failover
+  followed (`automatic_failover`). `cluster_status` shows the current
+  primary.
+* Do: fix the network or the dead agent. The node rejoins on its own: as
+  primary again if no failover happened (S12), or as a replica after a
+  rewind if one did (S2, S4). Nothing to do in SQL.
+
+**Fencing not active (`health_check`: "fencing is not active", `fence_state = inactive`)**
+* Meaning: `worlber_ha` is not loaded in this PostgreSQL. If this agent dies
+  while PostgreSQL keeps running, nothing stops the old primary.
+* Do: the agent already added `worlber_ha` to `shared_preload_libraries`
+  (ALTER SYSTEM). Restart PostgreSQL on that node in a maintenance window, a
+  replica first, then switchover and restart the old primary.
+
+**WAL archiving failing (`health_check` CRITICAL, `archive_failing` event)**
+* Meaning: `archive_command` fails. PostgreSQL keeps every un-archived WAL
+  segment, so `pg_wal` grows until archiving works again or the disk fills.
+* Check: `SELECT * FROM pg_stat_archiver` on the primary (last_failed_wal),
+  the PostgreSQL log for the archive_command error, free space and
+  permissions on the archive directory, the NFS/gcsfuse mount on every node.
+* Do: fix the mount or permission. Archiving catches up by itself and an
+  `archive_recovered` event is recorded. As a last resort, to save the
+  primary's disk, set `wal_archive_dir` to '' (archiving stops, and replicas
+  that fall far behind will need a re-seed).
+
+**Replica needs re-seed (`agent_status` "needs re-seed", `reseed_started` event)**
+* Meaning: the WAL this replica needs is gone from the primary (it was down
+  longer than `max_slot_wal_keep` allows) and not in a WAL archive.
+* Do: with `auto_reinit = true` (default) it re-seeds itself. Otherwise run
+  `SELECT worlber_ha.reinit_node('pg3')`. Limit the copy speed with
+  `set_config('seed_max_rate', '200M')`. Configure `wal_archive_dir` to avoid
+  re-seeds after long outages.
+
+**Failover blocked (`failover_blocked` event)**
+* Meaning: the primary is down but no standby is guaranteed to have every
+  acknowledged commit (the synchronous standby is also down), and
+  `async_failover = 'never'`.
+* Do: bring the synchronous standby back if you can (no data loss). If not,
+  and the business accepts losing the last commits:
+  `SELECT worlber_ha.failover(force => true)`. The event records the
+  estimated loss.
+
+**Join token rejected (`join_rejected` event)**
+* Meaning: the token was expired, already used by another host, unknown, or
+  the source IP hit the rate limit (5 per minute).
+* Do: create a new one with `SELECT worlber_ha.join_token()` and run
+  `worlber-ha-agent init --join-file <file>` again.
+
+**Rolling upgrade in progress (`fence_state = gate_closed`)**
+* Meaning: at least one node still runs an older agent, so the cluster uses
+  the older safety rules.
+* Do: finish upgrading every node. The gate opens by itself
+  (`fencing_gate_open` event).
+
 ## Testing
 
 **To try it, start with [`testing/TESTING.md`](testing/TESTING.md).** It has

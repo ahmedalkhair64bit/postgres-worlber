@@ -38,6 +38,7 @@ type leaseState struct {
 	writtenTS    int64 // this node: timestamp in the lease file we last wrote
 	writtenTTL   time.Duration
 	fenceChecked bool // fence settings checked since PostgreSQL last started
+	fenceLoaded  bool // the fence worker library is loaded (shared_preload_libraries)
 	fencing      bool // fencingLoop is stopping PostgreSQL
 }
 
@@ -368,6 +369,7 @@ func (a *Agent) ensureFence(ctx context.Context, h pg.Health) {
 		a.report(ctx, "fencing_inactive", "worlber_ha is not loaded; restart PostgreSQL to enable the fence worker")
 		a.mu.Lock()
 		a.lease.fenceChecked = true
+		a.lease.fenceLoaded = false
 		a.mu.Unlock()
 		return
 	}
@@ -388,6 +390,7 @@ func (a *Agent) ensureFence(ctx context.Context, h pg.Health) {
 	}
 	a.mu.Lock()
 	a.lease.fenceChecked = true
+	a.lease.fenceLoaded = true
 	a.mu.Unlock()
 }
 
@@ -400,21 +403,29 @@ func preloadHas(spl string) bool {
 	return false
 }
 
-// fenceState is shown in cluster_status.
+// fenceState is shown in cluster_status: armed, expired, inactive (worlber_ha
+// not in shared_preload_libraries), gate_closed (older agents in the
+// cluster), or unknown (not checked yet).  The second value is the age of the
+// lease this node last wrote, in seconds.
 func (a *Agent) fenceState() (string, *float64) {
+	gate := a.fsm.Get().FencingGate
 	a.mu.Lock()
-	ts, ttl, checked := a.lease.writtenTS, a.lease.writtenTTL, a.lease.fenceChecked
+	ts, ttl, checked, loaded := a.lease.writtenTS, a.lease.writtenTTL, a.lease.fenceChecked, a.lease.fenceLoaded
 	a.mu.Unlock()
 	var age *float64
 	if ts != 0 {
-		s := float64(safety.BootTime()-ts) / 1e9
-		age = &s
-		if time.Duration(safety.BootTime()-ts) > ttl {
-			return "expired", age
-		}
+		v := float64(safety.BootTime()-ts) / 1e9
+		age = &v
 	}
-	if !checked {
+	switch {
+	case !gate:
+		return "gate_closed", age
+	case !checked:
 		return "unknown", age
+	case !loaded:
+		return "inactive", age
+	case ts != 0 && time.Duration(safety.BootTime()-ts) > ttl:
+		return "expired", age
 	}
 	return "armed", age
 }

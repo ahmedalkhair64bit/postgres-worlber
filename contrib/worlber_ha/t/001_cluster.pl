@@ -210,6 +210,29 @@ $new_primary->safe_psql('postgres', 'SELECT worlber_ha.resume()');
 ($ret, $out, $err) = $new_primary->psql('postgres', "SELECT worlber_ha.set_config('failover_timeout', '1s')");
 like($err, qr/failover_timeout must be/, 'invalid option rejected');
 
+# --- Fencing / archive visibility (D13) -------------------------------------
+# The first agent adds worlber_ha to shared_preload_libraries and replicas
+# inherit it through pg_basebackup, so a promoted node runs the fence worker
+# ("armed").  Either way cluster_status and health_check must agree.
+my $fence = '';
+foreach (1 .. 60)
+{
+	$fence = $new_primary->safe_psql('postgres',
+		"SELECT coalesce(fence_state, '') FROM worlber_ha.cluster_status WHERE role = 'primary'");
+	last if $fence eq 'armed' || $fence eq 'inactive';
+	sleep 1;
+}
+like($fence, qr/^(armed|inactive)$/, "cluster_status reports the primary's fence state ($fence)");
+my $problems = $new_primary->safe_psql('postgres', "SELECT string_agg(problem, ' | ') FROM worlber_ha.health_check()");
+if ($fence eq 'inactive')
+{
+	like($problems, qr/fencing is not active/, 'health_check warns that fencing is not active');
+}
+else
+{
+	unlike($problems, qr/fencing is not active/, 'health_check does not warn while fencing is armed');
+}
+
 # --- Join token (W10) ------------------------------------------------------
 # A fresh cluster has the fencing gate open, so join_token works.
 my $jt = $new_primary->safe_psql('postgres', "SELECT worlber_ha.join_token('10 minutes', false)");

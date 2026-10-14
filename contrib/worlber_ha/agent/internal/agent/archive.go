@@ -194,3 +194,41 @@ func normalizeDur(s string) string {
 	}
 	return s
 }
+
+// archiveRow is the primary's WAL archiver state (pg_stat_archiver).
+type archiveRow struct {
+	Mode          string   `json:"mode"`
+	FailedCount   int64    `json:"failed_count"`
+	LastArchivedS *float64 `json:"last_archived_s"` // seconds since the last success
+	LastFailedS   *float64 `json:"last_failed_s"`   // seconds since the last failure
+	Failing       bool     `json:"failing"`
+}
+
+// archiveStatus reads pg_stat_archiver on the local primary and records
+// archive_failing / archive_recovered events on a change.  Archiving counts
+// as failing when the last attempt failed (last_failed_time is newer than
+// last_archived_time).
+func (a *Agent) archiveStatus(ctx context.Context) *archiveRow {
+	var r archiveRow
+	err := a.pg.QueryRow(ctx, `SELECT current_setting('archive_mode'), failed_count,
+			extract(epoch FROM now() - last_archived_time)::float8,
+			extract(epoch FROM now() - last_failed_time)::float8,
+			coalesce(last_failed_time > coalesce(last_archived_time, '-infinity'), false)
+		FROM pg_stat_archiver`, nil, &r.Mode, &r.FailedCount, &r.LastArchivedS, &r.LastFailedS, &r.Failing)
+	if err != nil {
+		return nil
+	}
+	if r.Mode == "off" {
+		r.Failing = false
+	}
+	a.mu.Lock()
+	was := a.archiveFailing
+	a.archiveFailing = r.Failing
+	a.mu.Unlock()
+	if r.Failing && !was {
+		a.report(ctx, "archive_failing", fmt.Sprintf("WAL archiving is failing (%d failures); pg_wal grows until it succeeds", r.FailedCount))
+	} else if !r.Failing && was {
+		a.report(ctx, "archive_recovered", "WAL archiving works again")
+	}
+	return &r
+}

@@ -56,7 +56,11 @@ type heartbeat struct {
 	Status  string    `json:"status"`
 	Epoch   uint64    `json:"epoch"`
 	Version int       `json:"version"`
-	At      time.Time `json:"-"`
+	// fencing and archiving state, shown in cluster_status / health_check
+	Fence    string      `json:"fence,omitempty"`
+	LeaseAge *float64    `json:"lease_age_s,omitempty"`
+	Archive  *archiveRow `json:"archive,omitempty"`
+	At       time.Time   `json:"-"`
 }
 
 // AgentVersion is the agent's protocol version.  1 (or absent) is the
@@ -88,6 +92,7 @@ type Agent struct {
 	noStreamAt        time.Time
 	archiveProgressAt time.Time // last time replay advanced during archive catch-up
 	lastReplay        uint64
+	archiveFailing    bool // last archiver check on this primary failed
 	quorumLost        time.Time
 	wasLeader         bool
 	leaderReady       bool   // barrier done in this leadership term
@@ -346,6 +351,12 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		a.local = h
 		hb := heartbeat{Node: a.cfg.Name, Health: h, Status: a.status, Epoch: a.fsm.Get().Epoch, Version: AgentVersion}
 		a.mu.Unlock()
+		if !a.cfg.Witness {
+			hb.Fence, hb.LeaseAge = a.fenceState()
+			if h.Running && !h.InRecovery {
+				hb.Archive = a.archiveStatus(ctx)
+			}
+		}
 
 		st := a.fsm.Get()
 		if _, member := st.Nodes[a.cfg.Name]; !member {

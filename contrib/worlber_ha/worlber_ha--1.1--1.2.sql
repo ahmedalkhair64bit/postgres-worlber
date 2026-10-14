@@ -124,6 +124,21 @@ BEGIN
 				sync_marked := (n->>'sync')::boolean;
 			END IF;
 		END IF;
+		IF n->>'role' = 'primary' AND coalesce((n->'archive'->>'failing')::boolean, false) THEN
+			severity := 'CRITICAL';
+			problem := 'WAL archiving is failing (' || coalesce(n->'archive'->>'failed_count', '?') ||
+					   ' failures): pg_wal keeps growing until it succeeds; check archive_command and the archive directory';
+			found_problem := true; RETURN NEXT;
+		END IF;
+		IF n->>'role' = 'primary' AND n->>'fence_state' = 'inactive' THEN
+			severity := 'WARNING';
+			problem := 'fencing is not active: add worlber_ha to shared_preload_libraries and restart PostgreSQL';
+			found_problem := true; RETURN NEXT;
+		ELSIF n->>'role' = 'primary' AND n->>'fence_state' = 'gate_closed' THEN
+			severity := 'WARNING';
+			problem := 'fencing waits for every node to run the current agent (rolling upgrade in progress)';
+			found_problem := true; RETURN NEXT;
+		END IF;
 		IF n->>'role' = 'replica' AND (n->>'lag_bytes')::bigint > maxlag THEN
 			severity := 'WARNING';
 			problem := 'replica lags ' || pg_size_pretty((n->>'lag_bytes')::bigint) || ', more than maximum_lag_on_failover';
@@ -168,3 +183,24 @@ $$;
 
 REVOKE ALL ON FUNCTION join_token(interval, boolean) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION join_token(interval, boolean) TO worlber_ha_admin;
+
+-- cluster_status: add fencing and archiving state per node.
+DROP VIEW cluster_status;
+CREATE VIEW cluster_status AS
+	SELECT n.node, n.host, n.port, n.role, n.state, n.sync, nullif(n.sync_state, '') AS sync_state,
+		   n.timeline, n.lsn::pg_lsn AS lsn, n.replay_lsn::pg_lsn AS replay_lsn,
+		   n.lag_bytes, n.raft_role,
+		   CASE WHEN n.last_seen_ms IS NOT NULL
+				THEN make_interval(secs => n.last_seen_ms / 1000.0) END AS last_seen,
+		   nullif(n.agent_status, '') AS agent_status,
+		   nullif(n.fence_state, '') AS fence_state,
+		   round(n.lease_age_s::numeric, 1) AS lease_age_s,
+		   (n.archive->>'failing')::boolean AS archive_failing,
+		   CASE WHEN n.archive->>'last_archived_s' IS NOT NULL
+				THEN make_interval(secs => (n.archive->>'last_archived_s')::float8) END AS last_archived
+	FROM jsonb_to_recordset(@extschema@.status()->'nodes')
+		 AS n(node text, host text, port int, role text, state text, sync boolean,
+			  sync_state text, timeline int, lsn text, replay_lsn text, lag_bytes bigint,
+			  raft_role text, last_seen_ms bigint, agent_status text,
+			  fence_state text, lease_age_s float8, archive jsonb);
+GRANT SELECT ON cluster_status TO worlber_ha_admin, pg_monitor;
