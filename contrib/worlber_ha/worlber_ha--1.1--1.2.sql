@@ -204,3 +204,57 @@ CREATE VIEW cluster_status AS
 			  raft_role text, last_seen_ms bigint, agent_status text,
 			  fence_state text, lease_age_s float8, archive jsonb);
 GRANT SELECT ON cluster_status TO worlber_ha_admin, pg_monitor;
+
+--
+-- Live proof: drill() and the proof view.
+--
+-- worlber_ha.drill() runs a planned switchover while measuring it.  Just
+-- before, the primary writes a row into worlber_ha_internal.canary; after,
+-- the drill checks that row on the new primary (no acknowledged write lost).
+-- The receipt is a drill_completed / drill_failed event with JSON detail.
+--
+CREATE SCHEMA worlber_ha_internal;
+CREATE TABLE worlber_ha_internal.canary (
+	id bigserial PRIMARY KEY,
+	written_at timestamptz NOT NULL DEFAULT now()
+);
+REVOKE ALL ON SCHEMA worlber_ha_internal FROM PUBLIC;
+
+CREATE FUNCTION drill(kind text DEFAULT 'switchover')
+RETURNS jsonb
+LANGUAGE sql VOLATILE
+AS $$
+	SELECT @extschema@.call('drill', jsonb_build_object('kind', kind), 900);
+$$;
+REVOKE ALL ON FUNCTION drill(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION drill(text) TO worlber_ha_admin;
+
+CREATE VIEW proof AS
+	WITH d AS (
+		SELECT seq, event_time, kind, detail::jsonb AS j
+		FROM @extschema@.events
+		WHERE kind IN ('drill_completed', 'drill_failed')
+	), last AS (
+		SELECT * FROM d ORDER BY seq DESC LIMIT 1
+	), last_fail AS (
+		SELECT max(seq) AS seq FROM d WHERE kind = 'drill_failed'
+	), af AS (
+		SELECT event_time, detail FROM @extschema@.events
+		WHERE kind = 'automatic_failover' ORDER BY seq DESC LIMIT 1
+	)
+	SELECT
+		(SELECT max(event_time) FROM d WHERE kind = 'drill_completed') AS last_proven_at,
+		last.kind = 'drill_completed' AS last_drill_passed,
+		(last.j->>'rto_ms')::int AS last_drill_rto_ms,
+		last.j->>'old_primary' AS last_drill_from,
+		last.j->>'new_primary' AS last_drill_to,
+		(last.j->>'canary_present')::boolean AS last_drill_canary_present,
+		last.j->>'error' AS last_drill_error,
+		(SELECT count(*) FROM d WHERE kind = 'drill_completed'
+			AND seq > coalesce((SELECT seq FROM last_fail), 0)) AS drill_pass_streak,
+		af.event_time AS last_automatic_failover_at,
+		af.detail AS last_automatic_failover
+	FROM (SELECT 1) one
+	LEFT JOIN last ON true
+	LEFT JOIN af ON true;
+GRANT SELECT ON proof TO worlber_ha_admin, pg_monitor;

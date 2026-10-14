@@ -29,7 +29,7 @@ var leaderOps = map[string]bool{
 	"status": true, "add_node": true, "remove_node": true, "set_sync": true,
 	"set_config": true, "switchover": true, "failover": true,
 	"replication": true, "record_event": true, "reinit_node": true, "verify_table": true,
-	"join_token": true, "join_consume": true,
+	"join_token": true, "join_consume": true, "drill": true,
 }
 
 // execute dispatches a request from the SQL extension.
@@ -56,7 +56,7 @@ func (a *Agent) execute(ctx context.Context, op string, args json.RawMessage) (o
 		}
 		var rep reply
 		timeout := 30 * time.Second
-		if op == "add_node" || op == "switchover" {
+		if op == "add_node" || op == "switchover" || op == "drill" {
 			timeout = 15 * time.Minute
 		}
 		if err := a.peerPostTimeout(ctx, addr, "/peer/op/"+op, args, &rep, timeout); err != nil {
@@ -115,6 +115,10 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 		return opResult{Result: a.buildStatus(a.fsm.Get(), false)}, nil
 	case "join_token":
 		return a.joinToken(ctx, args)
+	case "drill":
+		var req struct{ Kind string }
+		_ = json.Unmarshal(args, &req)
+		return a.drill(ctx, req.Kind)
 	case "join_consume":
 		var req joinRequest
 		if err := json.Unmarshal(args, &req); err != nil {

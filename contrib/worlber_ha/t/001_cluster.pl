@@ -242,6 +242,21 @@ $new_primary->safe_psql('postgres', 'CREATE ROLE joiner LOGIN');
 ($ret, $out, $err) = $new_primary->psql('postgres', "SET ROLE joiner; SELECT worlber_ha.join_token()");
 like($err, qr/permission denied/, 'non-admin cannot call join_token');
 
+# --- Live proof: drill() (W5) -----------------------------------------------
+# Run from a replica: the switchover stops the current primary, which would
+# cut a session connected to it.
+my $replica_for_drill;
+foreach my $node (@nodes)
+{
+	my ($r, $o) = $node->psql('postgres', 'SELECT pg_is_in_recovery()');
+	if ($r == 0 && $o eq 't') { $replica_for_drill = $node; last; }
+}
+my ($dret, $dout, $derr) = $replica_for_drill->psql('postgres', 'SELECT worlber_ha.drill()');
+is($dret, 0, "drill() completes ($derr)");
+poll_cluster("SELECT last_drill_passed::text || ':' || last_drill_canary_present::text || ':' || (last_drill_rto_ms > 0)::text FROM worlber_ha.proof",
+	'true:true:true', [$replica_for_drill], 'proof shows a passing drill, the canary row on the new primary and a measured RTO');
+diag('drill RTO ms: ' . $replica_for_drill->safe_psql('postgres', 'SELECT last_drill_rto_ms FROM worlber_ha.proof'));
+
 # --- Cleanup ---------------------------------------------------------------
 kill_agent($_) foreach keys %agents;
 foreach my $node (@nodes)

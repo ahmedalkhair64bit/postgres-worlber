@@ -19,6 +19,7 @@ ORDER BY 1;
  config
  connection_string
  create_cluster
+ drill
  event_log
  failover
  health_check
@@ -33,7 +34,7 @@ ORDER BY 1;
  status
  switchover
  verify_table
-(23 rows)
+(24 rows)
 
 SELECT c.relname, c.relkind
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -45,9 +46,10 @@ ORDER BY 1;
  cluster_config | v
  cluster_status | v
  events         | v
+ proof          | v
  redo           | v
  replication    | v
-(6 rows)
+(7 rows)
 
 -- management is restricted, monitoring is open to pg_monitor
 SELECT has_function_privilege('public', 'worlber_ha.switchover(text)', 'EXECUTE') AS public_switchover,

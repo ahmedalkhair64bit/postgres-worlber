@@ -394,6 +394,30 @@ Typical sequence of `events` during an automatic failover and rejoin:
 `vip_acquired` → `repointed` (other standbys) → later, on the old primary,
 `demoted` or `rejoin_started` → `rewind_completed` → `standby_started`.
 
+### Proving it works: `drill()` and `proof`
+
+Run a drill in a quiet period. It is a real, planned switchover, measured:
+
+```sql
+SELECT worlber_ha.drill();      -- run it from a replica session: the old primary restarts
+SELECT * FROM worlber_ha.proof;
+```
+
+1. The primary writes a row into `worlber_ha_internal.canary`.
+2. The switchover runs.
+3. The drill measures how long until the new primary accepts writes
+   (`last_drill_rto_ms`).
+4. It checks that the canary row is on the new primary
+   (`last_drill_canary_present`, which proves no acknowledged write was lost).
+
+`proof` shows:
+* the last passing drill (`last_proven_at`) and the last drill's result;
+* `drill_pass_streak`, the number of drills passed in a row;
+* the last automatic failover with its data-loss estimate.
+
+Each drill is also a `drill_completed` or `drill_failed` event whose detail
+is a JSON receipt.
+
 ### New columns in `cluster_status`
 
 | column | meaning |

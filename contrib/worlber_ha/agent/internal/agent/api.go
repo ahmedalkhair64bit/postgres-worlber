@@ -156,6 +156,7 @@ func (a *Agent) peerHandler() http.Handler {
 		fp, err := a.localFingerprint(r.Context(), req.DB, req.Table, req.WaitLSN)
 		writeReply(w, opResult{Result: fp}, err)
 	})
+	a.canaryHandlers(mux)
 	mux.HandleFunc("/peer/release_hold", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		a.holdUntil = time.Time{}
