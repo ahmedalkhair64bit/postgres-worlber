@@ -409,19 +409,20 @@ cmd_s10() {
     log "s10: stopping replica $rep"
     dc stop "$rep" >/dev/null
     log "s10: writing WAL on $p (2 GB) to invalidate $rep's slot"
-    # Incompressible random bytes (TOAST cannot shrink them); STORAGE external
-    # keeps them uncompressed. ~700 MB in batches, each followed by a WAL
-    # switch, comfortably past max_slot_wal_keep (64 MB).
-    sql "$p" "CREATE TABLE IF NOT EXISTS s10_bulk (id bigserial PRIMARY KEY, pad bytea)" >/dev/null
-    sql "$p" "ALTER TABLE s10_bulk ALTER COLUMN pad SET STORAGE external" >/dev/null
+    # pg_logical_emit_message writes its payload straight into WAL (no table,
+    # no TOAST compression): ~320 MB of WAL in seconds, far past
+    # max_slot_wal_keep (32 MB).  Checkpoints let the slot be invalidated.
+    sql "$p" "CREATE TABLE IF NOT EXISTS s10_bulk (id bigserial PRIMARY KEY, note text)" >/dev/null
+    sql "$p" "INSERT INTO s10_bulk (note) SELECT 'row ' || g FROM generate_series(1, 10000) g" >/dev/null
     local b
-    for b in $(seq 1 24); do
-        # ~16 MB of incompressible bytes per batch -> ~384 MB total
-        sql "$p" "INSERT INTO s10_bulk (pad) SELECT gen_random_bytes(1024*1024) FROM generate_series(1,16)" >/dev/null
+    for b in 1 2 3 4; do
+        sql "$p" "SELECT count(pg_logical_emit_message(false, 's10', repeat(md5(g::text), 32768))) FROM generate_series(1, 80) g" >/dev/null
         sql "$p" "SELECT pg_switch_wal()" >/dev/null
+        sql "$p" "CHECKPOINT" >/dev/null
     done
+    sql "$p" "INSERT INTO s10_bulk (note) SELECT 'after ' || g FROM generate_series(1, 10000) g" >/dev/null
     sql "$p" "CHECKPOINT" >/dev/null
-    local slotstat; slotstat=$(sql "$p" "SELECT coalesce(wal_status,'gone') FROM pg_replication_slots WHERE slot_name=(SELECT slot_name FROM worlber_ha.cluster_status WHERE node='$rep')" 2>/dev/null)
+    local slotstat; slotstat=$(sql "$p" "SELECT coalesce(max(wal_status),'gone') FROM pg_replication_slots WHERE slot_name='worlber_ha_$rep'" 2>/dev/null)
     log "s10: slot for $rep is now '$slotstat'"
     if [ "$slotstat" != lost ]; then
         log "s10: SKIP - could not invalidate $rep's slot (wal_status=$slotstat); needs more WAL or a smaller max_slot_wal_keep here"
@@ -436,20 +437,17 @@ cmd_s10() {
     dc start "$rep" >/dev/null
 
     # wait until the replica is streaming again (caught up)
-    if ! wait_until 600 "$rep streaming again" bash -c "[ \"\$($0 _streaming $rep)\" = t ]" 2>/dev/null; then
-        # fall back to a direct poll
-        local ok=
-        for _ in $(seq 1 600); do
-            [ "$(anysql "SELECT state FROM worlber_ha.cluster_status WHERE node='$rep'")" = streaming ] && { ok=1; break; }
-            sleep 1
-        done
-        [ -n "$ok" ] || { log "s10: $rep did not catch up"; return 1; }
-    fi
+    local ok=
+    for _ in $(seq 1 600); do
+        [ "$(anysql "SELECT state FROM worlber_ha.cluster_status WHERE node='$rep'")" = streaming ] && { ok=1; break; }
+        sleep 1
+    done
+    [ -n "$ok" ] || { log "s10: $rep did not catch up"; return 1; }
     local caught=$(( $(date +%s) - t0 ))
     local reseeds; reseeds=$(anysql "SELECT count(*) FROM worlber_ha.events WHERE node='$rep' AND kind IN ('reseed_started','standby_reseed') AND event_time > to_timestamp($t0)")
     # every node must match the primary (bool_and over verify_table rows)
     local match; match=$(sql "$p" "SELECT bool_and(matches_primary) FROM worlber_ha.verify_table('s10_bulk') WHERE role='replica'" 2>/dev/null)
-    local mbps; mbps=$(awk "BEGIN{printf \"%.1f\", $archived*16/$caught}")
+    local mbps; mbps=$(awk "BEGIN{c=$caught; if (c<1) c=1; printf \"%.1f\", $archived*16/c}")
     log "s10: caught up in ${caught}s, archived_segments=$archived (~${mbps} MB/s WAL), reseeds=$reseeds, verify_table match=$match"
     local matched=false
     [ "$match" = t ] || [ "$match" = true ] && matched=true
@@ -463,7 +461,6 @@ cmd_s10() {
 sc=${1:-}
 runs=${2:-1}
 if [ "$sc" = s10 ]; then cmd_s10; exit $?; fi
-if [ "$sc" = _streaming ]; then anysql "SELECT state FROM worlber_ha.cluster_status WHERE node='$2'"; exit 0; fi
 case "$sc" in s1|s1late|s2|s2b|s3|s4|s5|s7|s11|s12) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)

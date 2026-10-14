@@ -115,6 +115,7 @@ CHAOS_SOAK=30m ./chaos/run.sh s7        # no fault: false failovers, report canc
 | s3 | `docker pause` the whole primary node until the run ends | 0 acked rows missing (the lease clock keeps running while paused) |
 | s4 | network partition of the primary until the run ends | 0 acked rows missing |
 | s5 | kill the synchronous standby, then the primary (two of three nodes gone) | no promotion (no Raft majority), 0 acked rows missing, cluster recovers when a node returns |
+| s10 | `./chaos/run.sh s10`: archive on, a replica stopped, ~320 MB of WAL written so its slot is invalidated (`lost`), replica started again | replica catches up from the archive with no re-seed, `verify_table` matches |
 | s11 | full power loss: `docker kill` all three nodes, start them again after `CHAOS_DOWN` s (20) | cluster healthy again with no manual action, 0 acked rows missing |
 | s12 | network cut between all nodes for `CHAOS_DOWN` s (30), then reconnected | primary fences itself (no majority), cluster healthy again with no manual action, 0 acked rows missing |
 | s7 | none, for `CHAOS_SOAK`; long reports on port 5001 | 0 acked rows missing, 0 automatic failovers |
