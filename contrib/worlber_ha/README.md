@@ -263,6 +263,15 @@ applications to always find the primary:
 The lab (`testing/lab.sh`) has the listener on ports 5000/5001 and the VIP
 `172.28.0.100` enabled.
 
+**Listener cost (measured, chaos S7, docker lab, 8 unthrottled writer clients
+on persistent connections, 3 round trips per transaction):** median commit
+latency is the same through the listener and direct (3 ms), p99 is 8-9 ms vs
+7 ms, and peak throughput is about 15-25% lower (2,041-2,177 vs 2,568-2,706
+TPS), because every round trip takes one extra hop. For latency-critical,
+high-TPS writers, connect directly with a libpq multi-host string
+(`connection_string()`) or a load balancer on `/health/primary`, and keep
+the listener for everything else.
+
 
 ### WAL archive: recovering a long-offline replica
 
@@ -294,6 +303,20 @@ The leader prunes the archive to `archive_keep` (default `7d`) so a dead
 member cannot fill it forever. With a custom `archive_command`/`restore_command`
 (set directly with `set_config`) retention and free space are the operator's
 job.
+
+**Archive throughput (measured, chaos S7, archive on a local docker volume):**
+
+* **Burst:** unthrottled WAL at 77-154 MB/s for 10-30 s. Archiving kept the
+  same rate and no segment was left waiting (`.ready` backlog 0, drain time
+  0 s). This is the most WAL the lab could generate, not the archive's limit.
+* **30-minute soak:** 8 writer clients (3.47M acknowledged rows) plus extra
+  WAL, 1.38 MB/s in total. 153 segments archived, 0 archive failures, a
+  backlog of 0 for the whole soak, 0 failovers and 0 acknowledged rows lost.
+
+NFS and gcsfuse are slower per segment: before production, run
+`CHAOS_S7_BURST=30 ./testing/chaos/run.sh s7` against your mount to find its
+ceiling. `health_check()` reports CRITICAL as soon as archiving fails, and
+`archive_failing` events record it.
 
 ### Read-only routing (lag-aware)
 

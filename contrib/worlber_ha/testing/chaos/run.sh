@@ -281,7 +281,7 @@ s7_latency() {
             '. + {($m): {tps: (($v.summary.acked // 0) / $s | floor), ack_p50_ms: $v.summary.ack_p50_ms, ack_p99_ms: $v.summary.ack_p99_ms}}' <<<"$out")
     done
     log "s7: latency (P7): $(jq -c . <<<"$out")" >&2
-    printf '%s\n' "$out"
+    jq -c . <<<"$out"
 }
 # s7_sampler <file> <seconds>: every 30s on the primary, record time, WAL
 # position, archived segments and segments waiting to be archived (.ready).
