@@ -45,11 +45,18 @@ fi
 # container, so stop it cleanly after the agent ends.
 # With a VIP the agent needs CAP_NET_ADMIN/CAP_NET_RAW (ip addr, arping):
 # pass them as ambient capabilities to the unprivileged agent.
+# Chaos S9 (rolling upgrade): a binary at $STATE/override/worlber-ha-agent replaces the
+# image's agent, so a scenario can run an older or newer agent per node.
+AGENT=worlber-ha-agent
+if [ -x "$STATE/override/worlber-ha-agent" ]; then
+    AGENT=$STATE/override/worlber-ha-agent
+    echo "entrypoint: using $AGENT ($("$AGENT" --version 2>&1 | head -1))"
+fi
 caps=()
 if [ -n "${VIP:-}" ]; then
     caps=(--inh-caps=+net_admin,+net_raw --ambient-caps=+net_admin,+net_raw)
 fi
-setpriv --reuid=postgres --regid=postgres --init-groups "${caps[@]}" -- worlber-ha-agent \
+setpriv --reuid=postgres --regid=postgres --init-groups "${caps[@]}" -- "$AGENT" \
     --name "$NODE_NAME" \
     --token "$WORLBER_HA_TOKEN" \
     --data-dir "$STATE" \

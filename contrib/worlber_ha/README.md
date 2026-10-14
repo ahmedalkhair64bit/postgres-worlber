@@ -163,13 +163,29 @@ safety behaviour stays off until **every** node runs the new agent:
   behaviour: quorum-loss fencing only, and best-eligible failover (no lease
   self-fencing, no `actual_sync`). This is what stops a half-upgraded cluster
   from fencing a healthy node or committing an op an old node cannot apply.
-* the leader opens the **fencing gate** automatically once all members report
-  the new agent, recorded as a `fencing_gate_open` event. From then on the
-  lease fence worker and `actual_sync` failover are in force.
+* the leader opens the **fencing gate** once all members report the new
+  agent **and** you have run `ALTER EXTENSION worlber_ha UPDATE` on the
+  primary. It is recorded as a `fencing_gate_open` event, and
+  `worlber_ha.status()->>'fencing_gate'` shows it. From then on the lease
+  fence worker and `actual_sync` failover are in force.
+* until the gate opens, the agent keeps `worlber_ha.fence` **off** on every
+  node. An old leader never confirms leases, so an armed fence could stop a
+  healthy primary.
 
-Upgrade one node at a time (replicas first, then a switchover, then the old
-primary). Add `worlber_ha` to `shared_preload_libraries` and restart each
-node as you go so its fence worker is ready when the gate opens.
+Procedure (tested under load by chaos scenario S9, 3/3 runs: 0 failovers,
+0 acknowledged rows lost, the only write pause is the switchover, about 8s):
+
+1. Upgrade one replica at a time: stop the node, install the new agent and
+   extension files, make sure `worlber_ha` is in `shared_preload_libraries`,
+   start it, and wait until it is `streaming` again.
+2. Before you restart the synchronous standby, move sync to an upgraded
+   replica with `set_sync`.
+3. `SELECT worlber_ha.switchover('<upgraded replica>')`, then upgrade the
+   old primary the same way.
+4. **Point of no return:** `ALTER EXTENSION worlber_ha UPDATE` on the
+   primary. Before it, any node can be rolled back to the old agent (S9 rolls
+   one back and forward again under load). After it, the gate is open and
+   you can only roll forward. Run `drill()` on a staging cluster first.
 
 `create_cluster` prepares the primary:
 * it creates the role `worlber_ha_repl` (REPLICATION, plus the `pg_rewind`
@@ -501,8 +517,8 @@ Each entry: what you see, what it means, what to do.
 **Rolling upgrade in progress (`fence_state = gate_closed`)**
 * Meaning: at least one node still runs an older agent, so the cluster uses
   the older safety rules.
-* Do: finish upgrading every node. The gate opens by itself
-  (`fencing_gate_open` event).
+* Do: finish upgrading every node, then run `ALTER EXTENSION worlber_ha
+  UPDATE` on the primary. The gate then opens (`fencing_gate_open` event).
 
 ## Testing
 

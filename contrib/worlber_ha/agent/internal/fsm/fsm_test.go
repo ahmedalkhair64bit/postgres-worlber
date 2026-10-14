@@ -93,7 +93,16 @@ func (m *memSink) Close() error  { return nil }
 
 func TestFencingGate(t *testing.T) {
 	f := New()
-	if err := applyCmd(t, f, Command{Op: "bootstrap", ClusterName: "c", Node: &Node{Name: "a"}, Time: 1}); err != nil {
+	// A bootstrap entry from an older agent (no open_gate) keeps the gate
+	// closed when a new agent replays the log.
+	old := New()
+	if err := applyCmd(t, old, Command{Op: "bootstrap", ClusterName: "c", Node: &Node{Name: "a"}, Time: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if old.Get().FencingGate {
+		t.Fatal("replaying an old bootstrap entry must not open the gate")
+	}
+	if err := applyCmd(t, f, Command{Op: "bootstrap", ClusterName: "c", Node: &Node{Name: "a"}, Time: 1, OpenGate: true}); err != nil {
 		t.Fatal(err)
 	}
 	if !f.Get().FencingGate {

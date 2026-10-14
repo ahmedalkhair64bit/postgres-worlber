@@ -280,7 +280,7 @@ func (a *Agent) createCluster(ctx context.Context, args json.RawMessage) (opResu
 	node := &fsm.Node{Name: a.cfg.Name, PGHost: a.cfg.PGAdvertise, PGPort: a.cfg.PG.Port,
 		APIAddr: a.cfg.APIAddr, RaftAddr: a.cfg.RaftAddr}
 	if err := a.apply(fsm.Command{Op: "bootstrap", ClusterName: req.Name, SystemID: sysid,
-		ReplUser: a.cfg.ReplUser, ReplPassword: pw, Node: node}); err != nil {
+		ReplUser: a.cfg.ReplUser, ReplPassword: pw, Node: node, OpenGate: true}); err != nil {
 		return opResult{}, err
 	}
 	for k, v := range map[string]string{"synchronous_mode": req.SynchronousMode, "failover_timeout": req.FailoverTimeout} {
@@ -775,7 +775,7 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 	})
 	return map[string]any{
 		"cluster": st.ClusterName, "primary": st.Primary, "epoch": st.Epoch,
-		"leader": string(leaderID), "paused": st.Paused(), "nodes": rows,
+		"leader": string(leaderID), "paused": st.Paused(), "fencing_gate": st.FencingGate, "nodes": rows,
 	}
 }
 

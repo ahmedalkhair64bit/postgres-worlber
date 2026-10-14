@@ -14,6 +14,9 @@
 #           cannot restart PostgreSQL near the failover deadline
 #   s5   kill the sync standby, then the primary; must block (async_failover never)
 #   s7   soak: load and reports with no fault (CHAOS_SOAK, default 30m)
+#   s9   rolling upgrade from the 1.1 agent (origin/master) to this tree under
+#        load, with a pre-gate rollback of one replica; ALTER EXTENSION opens
+#        the fencing gate (recreates the lab)
 #   s10  WAL archive catch-up: offline replica recovers from the archive
 #   s11  full power loss: kill all nodes, start them again, must self-heal
 #   s12  network failure between all nodes, then recovery, must self-heal
@@ -382,6 +385,139 @@ run_one() { # run_one <scenario> <n> <stamp>
 }
 
 
+# s9: rolling upgrade 1.1 -> 1.2 under ledger load (W8 / D15).
+#   1. Recreate the lab with the 1.1 agent (built from origin/master) on every
+#      node and the extension at version 1.1.
+#   2. Upgrade the async replica, roll it back to 1.1 (pre-gate rollback),
+#      upgrade it again.  Move sync to it, upgrade the old sync standby.
+#   3. Switch over to an upgraded replica, upgrade the old primary.
+#   4. The gate stays closed until ALTER EXTENSION worlber_ha UPDATE TO '1.2'
+#      on the primary; then it opens and the primary's fence is armed.
+# Pass: 0 automatic failovers, 0 acknowledged rows lost, gate open, fence armed.
+OLD_REF=${CHAOS_S9_OLD_REF:-origin/master}
+s9_build_old() {
+    local wt="$RESULTS/s9-old-src"
+    rm -rf "$wt" "$RESULTS/s9-old"
+    git -C "$DIR" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    git -C "$DIR" worktree add -q --detach "$wt" "$OLD_REF" || return 1
+    mkdir -p "$RESULTS/s9-old/override"
+    (cd "$wt/contrib/worlber_ha/agent" && CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -o "$RESULTS/s9-old/override/worlber-ha-agent" ./cmd/worlber-ha-agent) || return 1
+    git -C "$DIR" worktree remove --force "$wt" >/dev/null 2>&1 || true
+}
+s9_set_agent() { # s9_set_agent <node> old|new : install the agent and restart the node
+    local node=$1 which=$2 c
+    c=$(dc ps -aq "$node")
+    dc exec -T "$node" rm -rf /var/lib/worlber_ha/override 2>/dev/null || true
+    if [ "$which" = old ]; then
+        docker cp "$RESULTS/s9-old/override" "$c:/var/lib/worlber_ha/" >/dev/null || return 1
+    fi
+    log "s9: $node -> $which agent (restart)"
+    dc restart "$node" >/dev/null
+    wait_until 60 dc exec -T "$node" test -S /var/run/postgresql/.s.WORLBER_HA.5432 || return 1
+    # healthy() can pass on a status taken before the restart: wait until
+    # this replica streams again locally, then let heartbeats settle.
+    wait_until 180 s9_streaming "$node" || { log "s9: $node not streaming after -> $which"; return 1; }
+    sleep 5
+    wait_until 180 healthy || { log "s9: cluster not healthy after $node -> $which"; return 1; }
+}
+s9_streaming() { [ "$(sql "$1" "SELECT status FROM pg_stat_wal_receiver" 2>/dev/null)" = streaming ]; }
+s9_gate() { anysql "SELECT coalesce(worlber_ha.status()->>'fencing_gate', 'false')" || echo unknown; }
+s9_failovers() { anysql "SELECT count(*) FROM worlber_ha.events WHERE kind = 'automatic_failover' AND event_time >= to_timestamp($1)" || echo -1; }
+
+cmd_s9() {
+    local base="$RESULTS/s9-$(date +%Y%m%d-%H%M%S)-1" t0 steps=() ok=true
+    mkdir -p "$RESULTS"
+    log "s9: building the old agent from $OLD_REF"
+    s9_build_old || { log "s9: cannot build the old agent"; return 1; }
+    "$RESULTS/s9-old/override/worlber-ha-agent" --version 2>&1 | head -1 | sed 's/^/[s9] old agent: /'
+    log "s9: recreating the lab on the old agent"
+    "$LAB" down >/dev/null 2>&1 || true
+    dc create pg1 pg2 pg3 >/dev/null
+    local n
+    for n in pg1 pg2 pg3; do
+        docker cp "$RESULTS/s9-old/override" "$(dc ps -aq "$n"):/var/lib/worlber_ha/" >/dev/null
+    done
+    LAB_SKIP_BUILD=1 "$LAB" up >/dev/null
+    sql pg1 "CREATE EXTENSION worlber_ha VERSION '1.1'"
+    sql pg1 "SELECT worlber_ha.create_cluster('lab', failover_timeout => '${LAB_FAILOVER_TIMEOUT:-10} seconds')" >/dev/null
+    sql pg1 "SELECT worlber_ha.add_node('pg2', sync => true)" >/dev/null
+    sql pg1 "SELECT worlber_ha.add_node('pg3')" >/dev/null
+    wait_until 240 healthy || { log "s9: old cluster not healthy"; return 1; }
+    log "s9: old cluster up: extension $(sql pg1 "SELECT extversion FROM pg_extension WHERE extname='worlber_ha'"), gate=$(s9_gate)"
+
+    t0=$(date +%s)
+    "$LEDGER" setup --dsn "$RW_DSN" --reset
+    "$LEDGER" write --dsn "$RW_DSN" --clients "$CLIENTS" --rate "$RATE" \
+        --connect-timeout 5s --duration "${CHAOS_S9_DURATION:-900s}" --out "$base.ledger" 2>"$base.writer.log" &
+    local writer=$!
+    sleep "$WARMUP"
+
+    local p; p=$(primary)
+    local ss; ss=$(sync_standby)
+    local as; as=$(anysql "SELECT node FROM worlber_ha.cluster_status WHERE role='replica' AND node <> '$ss' LIMIT 1")
+    log "s9: primary=$p sync=$ss async=$as"
+    # 2. async replica first, then the pre-gate rollback (D15), then again
+    s9_set_agent "$as" new || ok=false; steps+=("upgrade $as")
+    s9_set_agent "$as" old || ok=false; steps+=("rollback $as to 1.1")
+    local hc; hc=$(anysql "SELECT count(*) FROM worlber_ha.health_check() WHERE severity = 'CRITICAL'" || echo -1)
+    log "s9: after rollback: healthy, health_check CRITICAL rows=$hc, failovers=$(s9_failovers "$t0")"
+    [ "$hc" = 0 ] || ok=false
+    s9_set_agent "$as" new || ok=false; steps+=("upgrade $as again")
+    # move sync to the upgraded replica before restarting the sync standby
+    sql "$p" "SELECT worlber_ha.set_sync('$as', true)" >/dev/null
+    sql "$p" "SELECT worlber_ha.set_sync('$ss', false)" >/dev/null
+    wait_until 60 bash -c "[ \"\$(docker compose -f '$COMPOSE' exec -T -u postgres '$p' psql -X -qAt -c \"SELECT sync_state IN ('sync', 'quorum') FROM pg_stat_replication WHERE application_name = '$as'\")\" = t ]" || { log "s9: $as did not become the sync standby"; ok=false; }
+    s9_set_agent "$ss" new || ok=false; steps+=("upgrade $ss")
+    # 3. switchover to the upgraded sync replica, then upgrade the old primary
+    log "s9: switchover to $as"
+    local sw0; sw0=$(now_ms)
+    # run it on the target: the switchover stops the primary, cutting its sessions
+    sql "$as" "SELECT worlber_ha.switchover('$as')" >/dev/null || { log "s9: switchover failed"; ok=false; }
+    wait_until 120 bash -c "[ \"\$(docker compose -f '$COMPOSE' exec -T -u postgres '$as' psql -X -qAt -c 'SELECT pg_is_in_recovery()')\" = f ]" || ok=false
+    wait_until 180 s9_streaming "$p" || ok=false
+    wait_until 120 healthy || ok=false
+    [ "$(primary)" = "$as" ] || { log "s9: primary is $(primary), expected $as"; ok=false; }
+    local sw_ms=$(( $(now_ms) - sw0 ))
+    steps+=("switchover to $as (${sw_ms} ms)")
+    s9_set_agent "$p" new || ok=false; steps+=("upgrade $p")
+    local gate_before; gate_before=$(s9_gate)
+    log "s9: all agents upgraded; gate=$gate_before (must stay closed until ALTER EXTENSION)"
+    [ "$gate_before" = false ] || ok=false
+    # before the gate opens the fence must be off everywhere (an older leader
+    # never confirms leases, so an armed fence could stop a healthy primary)
+    local fence_pre="" n2
+    for n2 in pg1 pg2 pg3; do fence_pre+="$n2=$(sql "$n2" "SHOW worlber_ha.fence" 2>/dev/null) "; done
+    log "s9: fence before the gate: $fence_pre"
+    [[ "$fence_pre" == *"=on"* ]] && ok=false
+    # 4. point of no return
+    local np; np=$(primary)
+    sql "$np" "ALTER EXTENSION worlber_ha UPDATE TO '1.2'"
+    steps+=("ALTER EXTENSION on $np")
+    local fence=""
+    for _ in $(seq 1 120); do
+        fence=$(anysql "SELECT fence_state FROM worlber_ha.cluster_status WHERE role='primary'" || true)
+        [ "$(s9_gate)" = true ] && [ "$fence" = armed ] && break
+        sleep 1
+    done
+    local gate_after; gate_after=$(s9_gate)
+    log "s9: gate=$gate_after primary fence=$fence"
+    kill "$writer" 2>/dev/null || true
+    wait "$writer" 2>/dev/null || true
+    np=$(primary)
+    local verify; verify=$("$LEDGER" verify --ledger "$base.ledger" --dsn "host=${IP[$np]} port=5432 connect_timeout=2 $AUTH" || true)
+    [ -n "$verify" ] || verify='{"pass":false}'
+    local fo; fo=$(s9_failovers "$t0")
+    local pass=false
+    [ "$ok" = true ] && [ "$fo" = 0 ] && [ "$gate_after" = true ] && [ "$fence" = armed ] && [ "$(jq -r .pass <<<"$verify")" = true ] && pass=true
+    jq -n --argjson v "$verify" --argjson fo "$fo" --arg gb "$gate_before" --arg ga "$gate_after" --arg fence "$fence" --arg fence_pre "$fence_pre" \
+        --argjson sw "$sw_ms" --argjson pass "$pass" --arg steps "$(printf '%s\n' "${steps[@]}")" \
+        '{scenario:"s9", run:1, steps:($steps|split("\n")|map(select(.!=""))), automatic_failovers:$fo,
+          gate_before_alter:$gb, gate_after_alter:$ga, fence_before_gate:$fence_pre, primary_fence:$fence, switchover_ms:$sw,
+          verdict:$v, pass:$pass}' >"$base.json"
+    log "s9: pass=$pass failovers=$fo acked=$(jq '.acked // 0' <<<"$verify") missing=$(jq '.acked_missing // null' <<<"$verify") switchover=${sw_ms}ms gate=$gate_before->$gate_after fence=$fence"
+    [ "$pass" = true ]
+}
+
 # s10: WAL archive catch-up.  Enable the archive, stop a replica, write WAL
 # past max_slot_wal_keep so its slot is invalidated, restart it, and check it
 # caught up from the archive (no reseed_started event, verify_table matches).
@@ -461,6 +597,7 @@ cmd_s10() {
 sc=${1:-}
 runs=${2:-1}
 if [ "$sc" = s10 ]; then cmd_s10; exit $?; fi
+if [ "$sc" = s9 ]; then cmd_s9; exit $?; fi
 case "$sc" in s1|s1late|s2|s2b|s3|s4|s5|s7|s11|s12) ;; *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;; esac
 mkdir -p "$RESULTS"
 stamp=$(date +%Y%m%d-%H%M%S)

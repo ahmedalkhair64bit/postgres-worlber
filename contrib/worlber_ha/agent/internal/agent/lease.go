@@ -39,6 +39,7 @@ type leaseState struct {
 	writtenTTL   time.Duration
 	fenceChecked bool // fence settings checked since PostgreSQL last started
 	fenceLoaded  bool // the fence worker library is loaded (shared_preload_libraries)
+	fenceGate    bool // the fencing gate state when the fence was last checked
 	fencing      bool // fencingLoop is stopping PostgreSQL
 }
 
@@ -339,8 +340,9 @@ func childPIDs(pid int) []int {
 // a standby, so it is armed before a promotion), and makes sure worlber_ha
 // is in shared_preload_libraries.
 func (a *Agent) ensureFence(ctx context.Context, h pg.Health) {
+	gate := a.fsm.Get().FencingGate
 	a.mu.Lock()
-	done := a.lease.fenceChecked
+	done := a.lease.fenceChecked && a.lease.fenceGate == gate
 	a.mu.Unlock()
 	if done || !h.Running {
 		return
@@ -370,6 +372,29 @@ func (a *Agent) ensureFence(ctx context.Context, h pg.Health) {
 		a.mu.Lock()
 		a.lease.fenceChecked = true
 		a.lease.fenceLoaded = false
+		a.lease.fenceGate = gate
+		a.mu.Unlock()
+		return
+	}
+	if !gate {
+		// Older agents in the cluster: an older leader never confirms the
+		// lease, so an armed fence would stop a healthy primary (or a
+		// replica promoted before the gate opens).  Keep it off until the
+		// gate opens; quorum-loss demotion still applies.
+		var on string
+		if err := a.pg.QueryRow(ctx, "SELECT current_setting('worlber_ha.fence')", nil, &on); err != nil {
+			return
+		}
+		if on == "on" {
+			if err := a.pg.Exec(ctx, "ALTER SYSTEM SET worlber_ha.fence = off"); err != nil {
+				a.log.Warn("cannot turn off worlber_ha.fence", "error", err)
+				return
+			}
+			_ = a.pg.Exec(ctx, "SELECT pg_reload_conf()")
+			a.log.Info("fence worker off until the fencing gate opens")
+		}
+		a.mu.Lock()
+		a.lease.fenceChecked, a.lease.fenceLoaded, a.lease.fenceGate = true, true, false
 		a.mu.Unlock()
 		return
 	}
@@ -389,8 +414,7 @@ func (a *Agent) ensureFence(ctx context.Context, h pg.Health) {
 		a.report(ctx, "fencing_enabled", "fence worker armed")
 	}
 	a.mu.Lock()
-	a.lease.fenceChecked = true
-	a.lease.fenceLoaded = true
+	a.lease.fenceChecked, a.lease.fenceLoaded, a.lease.fenceGate = true, true, true
 	a.mu.Unlock()
 }
 

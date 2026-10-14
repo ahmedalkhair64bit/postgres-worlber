@@ -60,7 +60,10 @@ type heartbeat struct {
 	Fence    string      `json:"fence,omitempty"`
 	LeaseAge *float64    `json:"lease_age_s,omitempty"`
 	Archive  *archiveRow `json:"archive,omitempty"`
-	At       time.Time   `json:"-"`
+	// ExtVersion is the installed worlber_ha extension version, reported by
+	// the primary ("absent" when it is not installed in the agent's database).
+	ExtVersion string    `json:"ext_version,omitempty"`
+	At         time.Time `json:"-"`
 }
 
 // AgentVersion is the agent's protocol version.  1 (or absent) is the
@@ -355,6 +358,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 			hb.Fence, hb.LeaseAge = a.fenceState()
 			if h.Running && !h.InRecovery {
 				hb.Archive = a.archiveStatus(ctx)
+				hb.ExtVersion = a.extVersion(ctx)
 			}
 		}
 

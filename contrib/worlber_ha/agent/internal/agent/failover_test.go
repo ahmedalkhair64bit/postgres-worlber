@@ -141,3 +141,14 @@ func TestValidateNewOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestExtReady(t *testing.T) {
+	for _, c := range []struct {
+		v    string
+		want bool
+	}{{"", false}, {"1.0", false}, {"1.1", false}, {"1.2", true}, {"1.10", true}, {"2.0", true}, {"absent", true}} {
+		if got := extReady(c.v); got != c.want {
+			t.Errorf("extReady(%q) = %v, want %v", c.v, got, c.want)
+		}
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
@@ -154,6 +156,12 @@ func (a *Agent) leaderLoop(ctx context.Context) {
 func (a *Agent) maybeOpenGate() {
 	st := a.fsm.Get()
 	if !st.Bootstrapped() || st.FencingGate {
+		return
+	}
+	// The DBA opens the gate with ALTER EXTENSION worlber_ha UPDATE on the
+	// primary; until then every node can still be rolled back to the old
+	// agent (the point of no return is that ALTER EXTENSION).
+	if hb, fresh := a.beat(st.Primary); !fresh || !extReady(hb.ExtVersion) {
 		return
 	}
 	members := make([]string, 0, len(st.Nodes))
@@ -319,4 +327,50 @@ func (a *Agent) lossEstimate(st fsm.State, cand string, primary heartbeat) strin
 		ago = time.Since(primary.At).Round(time.Second).String()
 	}
 	return fmt.Sprintf("estimated data loss: up to %d bytes of WAL (asynchronous standby; primary last seen %s ago)", lag, ago)
+}
+
+// GateExtVersion is the extension version whose installation opens the
+// fencing gate on an upgraded cluster.
+const GateExtVersion = "1.2"
+
+// extReady reports whether the primary's extension is at GateExtVersion or
+// later.  "absent" (the extension lives in another database) does not block,
+// so such a cluster opens the gate on agent versions alone.
+func extReady(v string) bool {
+	switch v {
+	case "":
+		return false // not reported (old agent, or no primary report yet)
+	case "absent":
+		return true
+	}
+	return versionAtLeast(v, GateExtVersion)
+}
+
+// versionAtLeast compares dotted numeric versions ("1.10" > "1.2").
+func versionAtLeast(v, min string) bool {
+	a, b := strings.Split(v, "."), strings.Split(min, ".")
+	for i := 0; i < len(a) || i < len(b); i++ {
+		var x, y int
+		if i < len(a) {
+			x, _ = strconv.Atoi(a[i])
+		}
+		if i < len(b) {
+			y, _ = strconv.Atoi(b[i])
+		}
+		if x != y {
+			return x > y
+		}
+	}
+	return true
+}
+
+// extVersion returns the installed worlber_ha extension version in the
+// agent's database, "absent" if it is not installed there, or "" on error.
+func (a *Agent) extVersion(ctx context.Context) string {
+	var v string
+	err := a.pg.QueryRow(ctx, "SELECT coalesce((SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha'), 'absent')", nil, &v)
+	if err != nil {
+		return ""
+	}
+	return v
 }

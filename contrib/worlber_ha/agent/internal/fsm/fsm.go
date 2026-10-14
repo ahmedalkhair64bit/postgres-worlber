@@ -130,6 +130,10 @@ type Command struct {
 
 	// open_gate
 	GateMembers []string `json:"gate_members,omitempty"`
+	// bootstrap: set by fencing-aware agents.  A bootstrap entry written by
+	// an older agent lacks it, so replaying an old log keeps the gate closed
+	// exactly as the older agents see it.
+	OpenGate bool `json:"open_gate,omitempty"`
 
 	// join_token / consume_join_token
 	TokenHash string `json:"token_hash,omitempty"`
@@ -275,7 +279,7 @@ func (s *State) apply(c Command) error {
 		s.Nodes[c.Node.Name] = c.Node
 		s.Primary = c.Node.Name
 		s.Epoch = 1
-		s.FencingGate = true
+		s.FencingGate = c.OpenGate
 		s.event(c.Time, "cluster_created", c.Node.Name, "cluster "+c.ClusterName+" created")
 
 	case "add_node":
