@@ -13,6 +13,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
+use HTTP::Tiny;
+use MIME::Base64 qw(decode_base64);
 
 my $agent_bin = $ENV{WORLBER_HA_AGENT};
 if (!defined $agent_bin || !-x $agent_bin)
@@ -241,6 +243,55 @@ like($jt, qr/^wjt1\./, 'join_token returns a wjt1 token');
 $new_primary->safe_psql('postgres', 'CREATE ROLE joiner LOGIN');
 ($ret, $out, $err) = $new_primary->psql('postgres', "SET ROLE joiner; SELECT worlber_ha.join_token()");
 like($err, qr/permission denied/, 'non-admin cannot call join_token');
+
+# --- Join hardening (D16) ----------------------------------------------------
+# The token is read from a file or stdin, so it stays out of shell history.
+my $jt_file = "$PostgreSQL::Test::Utils::tmp_check/join.token";
+open my $jfh, '>', $jt_file or die $!;
+print $jfh "$jt\n";
+close $jfh;
+my ($dry_out, $dry_err) = run_command([ $agent_bin, 'init', '--join-file', $jt_file, '--name', 'pg9', '--dry-run' ]);
+like($dry_out, qr/cluster: prod/, 'init --join-file reads the token (dry run)');
+my $dry_stdin = `printf '%s' '$jt' | '$agent_bin' init --join-file - --name pg9 --dry-run`;
+like($dry_stdin, qr/cluster: prod/, 'init --join-file - reads the token from stdin');
+
+# Redeem it by hand against /peer/join (no cluster token: the nonce is the auth).
+my $jt_json = $jt =~ s/^wjt1\.//r;
+$jt_json =~ tr{-_}{+/};
+$jt_json .= '=' x ((4 - length($jt_json) % 4) % 4);
+my ($nonce) = decode_base64($jt_json) =~ /"nonce":"([0-9a-f]{64})"/;
+ok(defined $nonce, 'the join token carries a nonce');
+my $join_url = "http://127.0.0.1:$ports{$new_primary->name}{api}/peer/join";
+my $http = HTTP::Tiny->new(timeout => 30);
+sub join_post
+{
+	my ($n, $name) = @_;
+	my $body = sprintf('{"nonce":"%s","name":"%s","api_addr":"127.0.0.1:1","raft_addr":"127.0.0.1:2"}', $n, $name);
+	return $http->post($join_url, { content => $body, headers => { 'Content-Type' => 'application/json' } });
+}
+my $r = join_post($nonce, 'pg9');
+like($r->{content}, qr/"ok":true.*"token":"\Q$token\E"/, 'first use of the join token returns the cluster secret');
+$r = join_post($nonce, 'pg9');
+like($r->{content}, qr/"ok":true.*"token":"\Q$token\E"/, 'a retry from the same host gets the same reply (retry-safe)');
+$r = join_post($nonce, 'pg8');
+like($r->{content}, qr/already used by another host/, 'another host cannot reuse a consumed token');
+$r = join_post('0' x 64, 'pg8');
+like($r->{content}, qr/unknown or already-pruned/, 'an unknown nonce is rejected');
+my $short = $new_primary->safe_psql('postgres', "SELECT worlber_ha.join_token('1 second', false)");
+my $short_json = $short =~ s/^wjt1\.//r;
+$short_json =~ tr{-_}{+/};
+$short_json .= '=' x ((4 - length($short_json) % 4) % 4);
+my ($short_nonce) = decode_base64($short_json) =~ /"nonce":"([0-9a-f]{64})"/;
+sleep 3;
+$r = join_post($short_nonce, 'pg8');
+like($r->{content}, qr/expired|unknown or already-pruned/, 'an expired join token is rejected');
+# That was the 5th attempt from 127.0.0.1 this minute: the 6th gets 429.
+$r = join_post($nonce, 'pg9');
+is($r->{status}, 429, 'the 6th join attempt in a minute is rate-limited');
+poll_cluster("SELECT count(*) >= 4 FROM worlber_ha.events WHERE kind = 'join_rejected'",
+	't', [$new_primary], 'rejected joins are recorded as join_rejected events');
+like($new_primary->safe_psql('postgres', "SELECT string_agg(detail, ' | ') FROM worlber_ha.events WHERE kind = 'join_rejected'"),
+	qr/rate limit from 127\.0\.0\.1/, 'join_rejected records the source IP');
 
 # --- Live proof: drill() (W5) -----------------------------------------------
 # Run from a replica: the switchover stops the current primary, which would
