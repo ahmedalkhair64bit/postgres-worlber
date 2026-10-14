@@ -168,6 +168,9 @@ func (a *Agent) peerHandler() http.Handler {
 	outer := http.NewServeMux()
 	outer.HandleFunc("/health", a.health)
 	outer.HandleFunc("/health/", a.health)
+	// /peer/join is redeemed with a one-time token, so it is the only peer
+	// endpoint not behind the cluster token (the new node has no token yet).
+	outer.HandleFunc("/peer/join", a.handleJoin)
 	outer.Handle("/", a.requireToken(mux))
 	return outer
 }

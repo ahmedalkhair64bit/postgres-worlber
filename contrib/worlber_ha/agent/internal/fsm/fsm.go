@@ -92,6 +92,17 @@ type State struct {
 	// FSM with ops an old agent cannot apply.  A cluster created at this
 	// version opens the gate at bootstrap.
 	FencingGate bool `json:"fencing_gate,omitempty"`
+	// JoinTokens are the outstanding one-time join tokens (only the nonce
+	// hash is kept).  Expired or consumed-and-old entries are pruned.
+	JoinTokens []JoinToken `json:"join_tokens,omitempty"`
+}
+
+// JoinToken is a stored one-time join token.
+type JoinToken struct {
+	Hash      string `json:"hash"`
+	Expiry    int64  `json:"exp"`
+	Sync      bool   `json:"sync"`
+	ClaimedBy string `json:"claimed_by,omitempty"`
 }
 
 // Command is a state change committed through Raft.
@@ -119,6 +130,11 @@ type Command struct {
 
 	// open_gate
 	GateMembers []string `json:"gate_members,omitempty"`
+
+	// join_token / consume_join_token
+	TokenHash string `json:"token_hash,omitempty"`
+	Expiry    int64  `json:"expiry,omitempty"`
+	ClaimedBy string `json:"claimed_by,omitempty"`
 
 	// event
 	Kind   string `json:"kind,omitempty"`
@@ -355,6 +371,32 @@ func (s *State) apply(c Command) error {
 		}
 		s.FencingGate = true
 		s.event(c.Time, "fencing_gate_open", "", "all members run the fencing agent")
+
+	case "join_token":
+		// prune expired/consumed tokens, then add the new one
+		kept := s.JoinTokens[:0]
+		for _, jt := range s.JoinTokens {
+			if jt.Expiry >= c.Time && jt.ClaimedBy == "" {
+				kept = append(kept, jt)
+			}
+		}
+		s.JoinTokens = append(kept, JoinToken{Hash: c.TokenHash, Expiry: c.Expiry, Sync: c.Sync})
+		s.event(c.Time, "join_token_created", "", "a one-time join token was issued")
+
+	case "consume_join_token":
+		found := false
+		for i := range s.JoinTokens {
+			if s.JoinTokens[i].Hash == c.TokenHash {
+				if s.JoinTokens[i].ClaimedBy != "" && s.JoinTokens[i].ClaimedBy != c.ClaimedBy {
+					return fmt.Errorf("join token already used")
+				}
+				s.JoinTokens[i].ClaimedBy = c.ClaimedBy
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("unknown join token")
+		}
 
 	case "actual_sync":
 		for _, n := range c.SyncNodes {

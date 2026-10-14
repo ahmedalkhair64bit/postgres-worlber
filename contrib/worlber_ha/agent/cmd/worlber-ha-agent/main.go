@@ -38,6 +38,10 @@ func envInt(key string, def int) int {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		runInit(os.Args[2:])
+		return
+	}
 	host, _ := os.Hostname()
 	var (
 		name        = flag.String("name", env("WORLBER_HA_NAME", host), "unique node name")

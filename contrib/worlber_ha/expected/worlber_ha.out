@@ -22,6 +22,7 @@ ORDER BY 1;
  event_log
  failover
  health_check
+ join_token
  pause
  reinit_node
  remove_node
@@ -32,7 +33,7 @@ ORDER BY 1;
  status
  switchover
  verify_table
-(22 rows)
+(23 rows)
 
 SELECT c.relname, c.relkind
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

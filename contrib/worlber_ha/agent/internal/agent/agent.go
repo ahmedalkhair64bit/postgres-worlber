@@ -102,8 +102,9 @@ type Agent struct {
 
 	stop context.CancelFunc // ends Run (used when removed from the cluster)
 
-	logs   *logRing
-	router *router
+	logs        *logRing
+	router      *router
+	joinLimiter *rateLimiter
 
 	evMu      sync.Mutex    // protects pending (separate from mu: report() may be called with mu held)
 	pending   []fsm.Command // events waiting for delivery to the leader
@@ -141,7 +142,8 @@ func New(cfg Config) (*Agent, error) {
 		beats:    map[string]heartbeat{},
 		syncSeen: map[string]syncView{},
 
-		eventKick: make(chan struct{}, 1),
+		eventKick:   make(chan struct{}, 1),
+		joinLimiter: newRateLimiter(5, time.Minute),
 	}
 	return a, nil
 }

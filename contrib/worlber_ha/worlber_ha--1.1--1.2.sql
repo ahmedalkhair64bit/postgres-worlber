@@ -153,3 +153,18 @@ BEGIN
 	END IF;
 END
 $$;
+
+-- join_token: issue a one-time token so a new node can join with a single
+-- command (worlber-ha-agent init --join <token>) instead of copying the
+-- cluster secret by hand.  Only the nonce hash is stored in the cluster
+-- state; the token is single-use and expires.
+CREATE FUNCTION join_token(ttl interval DEFAULT '1 hour', sync boolean DEFAULT false)
+RETURNS text
+LANGUAGE sql VOLATILE
+AS $$
+	SELECT (@extschema@.call('join_token',
+		jsonb_build_object('ttl_seconds', extract(epoch FROM ttl)::int, 'sync', sync)))->>'token';
+$$;
+
+REVOKE ALL ON FUNCTION join_token(interval, boolean) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION join_token(interval, boolean) TO worlber_ha_admin;

@@ -29,6 +29,7 @@ var leaderOps = map[string]bool{
 	"status": true, "add_node": true, "remove_node": true, "set_sync": true,
 	"set_config": true, "switchover": true, "failover": true,
 	"replication": true, "record_event": true, "reinit_node": true, "verify_table": true,
+	"join_token": true, "join_consume": true,
 }
 
 // execute dispatches a request from the SQL extension.
@@ -112,6 +113,14 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	switch op {
 	case "status":
 		return opResult{Result: a.buildStatus(a.fsm.Get(), false)}, nil
+	case "join_token":
+		return a.joinToken(ctx, args)
+	case "join_consume":
+		var req joinRequest
+		if err := json.Unmarshal(args, &req); err != nil {
+			return opResult{}, err
+		}
+		return a.consumeJoin(ctx, req)
 	case "replication":
 		return opResult{Result: a.replicationStatus(a.fsm.Get())}, nil
 	case "reinit_node":

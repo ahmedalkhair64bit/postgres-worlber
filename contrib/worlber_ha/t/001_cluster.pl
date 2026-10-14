@@ -210,6 +210,15 @@ $new_primary->safe_psql('postgres', 'SELECT worlber_ha.resume()');
 ($ret, $out, $err) = $new_primary->psql('postgres', "SELECT worlber_ha.set_config('failover_timeout', '1s')");
 like($err, qr/failover_timeout must be/, 'invalid option rejected');
 
+# --- Join token (W10) ------------------------------------------------------
+# A fresh cluster has the fencing gate open, so join_token works.
+my $jt = $new_primary->safe_psql('postgres', "SELECT worlber_ha.join_token('10 minutes', false)");
+like($jt, qr/^wjt1\./, 'join_token returns a wjt1 token');
+# A non-admin role cannot mint one.
+$new_primary->safe_psql('postgres', 'CREATE ROLE joiner LOGIN');
+($ret, $out, $err) = $new_primary->psql('postgres', "SET ROLE joiner; SELECT worlber_ha.join_token()");
+like($err, qr/permission denied/, 'non-admin cannot call join_token');
+
 # --- Cleanup ---------------------------------------------------------------
 kill_agent($_) foreach keys %agents;
 foreach my $node (@nodes)
