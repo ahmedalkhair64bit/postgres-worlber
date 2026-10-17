@@ -71,6 +71,14 @@ that just died, failover would die with it.
   * `failover_timeout` must be at least 7 seconds for this bound to hold.
 * The agent on the primary also stops PostgreSQL (fast shutdown) when it loses
   contact with the Raft majority for `failover_timeout / 3`.
+* **No automatic failover away from a primary without a fence worker.** Each
+  node's fence state (loaded or not) is committed in Raft. If the primary's
+  agent is unreachable and its fence worker was never confirmed loaded (for
+  example, a new cluster before its first PostgreSQL restart), the leader
+  refuses the automatic failover and records `failover_blocked`. Nothing
+  would stop that old PostgreSQL from accepting writes. If the agent is
+  reachable and only PostgreSQL is down, failover runs as usual. Once you have
+  confirmed the old primary is down, run `SELECT worlber_ha.failover()`.
 * An agent only starts or promotes PostgreSQL as primary, or demotes it, after
   the Raft leader confirms the current epoch. A restarted agent replaying an old
   Raft log can therefore never bring back a stale primary.
@@ -498,10 +506,15 @@ Each entry: what you see, what it means, what to do.
 
 **Fencing not active (`health_check`: "fencing is not active", `fence_state = inactive`)**
 * Meaning: `worlber_ha` is not loaded in this PostgreSQL. If this agent dies
-  while PostgreSQL keeps running, nothing stops the old primary.
+  while PostgreSQL keeps running, nothing stops the old primary, so the
+  cluster will **not** fail over away from it automatically
+  (`failover_blocked`: "fence worker was never confirmed loaded").
 * Do: the agent already added `worlber_ha` to `shared_preload_libraries`
   (ALTER SYSTEM). Restart PostgreSQL on that node in a maintenance window, a
   replica first, then switchover and restart the old primary.
+* If the primary is already down with `failover_blocked`: make sure its
+  PostgreSQL is really stopped (or the host is off), then run
+  `SELECT worlber_ha.failover()` on a replica.
 
 **WAL archiving failing (`health_check` CRITICAL, `archive_failing` event)**
 * Meaning: `archive_command` fails. PostgreSQL keeps every un-archived WAL

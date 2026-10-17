@@ -85,6 +85,12 @@ func (a *Agent) ensureArchiving(ctx context.Context) (bool, error) {
 	if dir == "" {
 		return false, nil // archiving not configured: leave it as the operator set it
 	}
+	if curCmd == "(disabled)" {
+		// archiving is not active yet (archive_mode off or waiting for a
+		// restart), so the server shows "(disabled)": compare with the
+		// configured value instead, or this would set it on every pass
+		_ = a.pg.QueryRow(ctx, "SELECT coalesce((SELECT setting FROM pg_file_settings WHERE name = 'archive_command' AND error IS NULL ORDER BY seqno DESC LIMIT 1), '')", nil, &curCmd)
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		a.log.Warn("cannot create the WAL archive directory", "dir", dir, "error", err)
 	}

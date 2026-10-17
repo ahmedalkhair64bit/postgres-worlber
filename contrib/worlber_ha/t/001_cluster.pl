@@ -170,6 +170,11 @@ $n2->safe_psql('postgres', 'INSERT INTO t SELECT generate_series(101, 200)');
 poll_cluster('SELECT count(*) FROM t', '200', [$n1], 'old primary node1 follows node2');
 poll_cluster('SELECT count(*) FROM t', '200', [$n3], 'node3 follows node2');
 
+# Every data node's fence worker is committed as loaded before the failover
+# test: automatic failover away from an unreachable primary needs it.
+poll_cluster("SELECT count(DISTINCT node) FROM worlber_ha.events WHERE kind = 'fence_loaded'",
+	'3', [$n2, $n3], 'fence worker loaded is committed for every data node');
+
 # --- Automatic failover: lose node2 (agent and server) ---------------------
 kill_agent('node2', 'KILL');
 # node2 was started by its agent, so Cluster.pm does not track its pid
@@ -369,6 +374,39 @@ pass('a running standby gets archive_mode for its next restart');
 sleep(10);    # several reconcile passes
 is($arch_primary->safe_psql('postgres', "SELECT count(*) <= 3 FROM worlber_ha.events WHERE kind = 'archive_restart_needed'"),
 	't', 'archive_restart_needed is reported once per node, not on every pass');
+# Before the restart the server shows archive_command as "(disabled)": the
+# agent must not take that for a different command and set it every pass.
+my $alog = slurp_file("$PostgreSQL::Test::Utils::log_path/agent_" . $arch_standby->name . '.log');
+my $sets = () = $alog =~ /archive_command set/g;
+ok($sets <= 1, "archive_command set once on the standby (set $sets times)");
+
+# --- No automatic failover away from a primary without a fence worker -----
+# The primary restarts without worlber_ha in shared_preload_libraries, then
+# its agent dies while PostgreSQL keeps running.  Promoting a standby now
+# would leave two writable primaries: the leader must refuse, and say so.
+my $nofence = $arch_primary;
+my ($nf_name) = $nofence->name;
+my @nf_others = grep { $_->name ne $nf_name } @nodes;
+$nofence->safe_psql('postgres', 'ALTER SYSTEM RESET shared_preload_libraries');
+system_log('pg_ctl', '-D', $nofence->data_dir, '-m', 'fast', '-w', 'restart');
+$nofence->poll_query_until('postgres', "SELECT count(*) = 0 FROM pg_settings WHERE name = 'worlber_ha.fence'")
+  or die 'worlber_ha still loaded after the restart';
+poll_cluster("SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'fence_not_loaded' AND node = '$nf_name'",
+	't', \@nf_others, 'the primary without a fence worker is committed as such');
+kill_agent($nf_name, 'KILL');
+poll_cluster("SELECT count(*) > 0 FROM worlber_ha.events WHERE kind = 'failover_blocked' AND detail LIKE '%never confirmed loaded%'",
+	't', \@nf_others, 'automatic failover is refused, with the reason');
+is($nf_others[0]->safe_psql('postgres', "SELECT node FROM worlber_ha.cluster_status WHERE role = 'primary'"),
+	$nf_name, 'the primary is unchanged');
+# The DBA confirms the old primary is down, then fails over by hand.
+system_log('pg_ctl', '-D', $nofence->data_dir, '-m', 'immediate', 'stop');
+($ret, $out, $err) = $nf_others[0]->psql('postgres', 'SELECT worlber_ha.failover()');
+is($ret, 0, "manual failover() still works ($err)");
+poll_cluster("SELECT count(*) FROM worlber_ha.cluster_status WHERE role = 'primary' AND state = 'running' AND node <> '$nf_name'",
+	'1', \@nf_others, 'a standby was promoted by the manual failover');
+start_agent($nofence);
+poll_cluster("SELECT role || ':' || state FROM worlber_ha.cluster_status WHERE node = '$nf_name'",
+	'replica:streaming', \@nf_others, 'the old primary rejoins as a replica');
 
 # --- Cleanup ---------------------------------------------------------------
 kill_agent($_) foreach keys %agents;

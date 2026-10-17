@@ -152,3 +152,23 @@ func TestExtReady(t *testing.T) {
 		}
 	}
 }
+
+func TestFenceBlocksFailover(t *testing.T) {
+	st := fsm.State{ClusterName: "c", Primary: "pg1", FencingGate: true, Nodes: map[string]*fsm.Node{
+		"pg1": {Name: "pg1"}, "pg2": {Name: "pg2", FenceLoaded: true},
+	}}
+	if fenceBlocksFailover(st, false) == "" {
+		t.Fatal("unreachable primary without a loaded fence must block automatic failover")
+	}
+	if fenceBlocksFailover(st, true) != "" {
+		t.Fatal("a reachable agent keeps its PostgreSQL down: must not block")
+	}
+	st.Nodes["pg1"].FenceLoaded = true
+	if fenceBlocksFailover(st, false) != "" {
+		t.Fatal("a loaded fence must not block")
+	}
+	st.Nodes["pg1"].FenceLoaded, st.FencingGate = false, false
+	if fenceBlocksFailover(st, false) != "" {
+		t.Fatal("before the gate opens the cluster fails over like the older agent")
+	}
+}

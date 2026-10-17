@@ -146,6 +146,7 @@ func (a *Agent) leaderLoop(ctx context.Context) {
 		}
 		a.maybeOpenGate()
 		a.reconcileActualSync()
+		a.reconcileFenceState()
 		a.checkPrimary()
 	}
 }
@@ -178,6 +179,58 @@ func (a *Agent) maybeOpenGate() {
 	} else {
 		a.log.Info("fencing gate opened: all members run the fencing agent")
 	}
+}
+
+// reconcileFenceState commits each data node's fence worker state (loaded or
+// not) as its agent reports it, so the decision in checkPrimary survives a
+// leader change and the loss of the primary's agent.  Leader only.
+func (a *Agent) reconcileFenceState() {
+	st := a.fsm.Get()
+	if !st.Bootstrapped() || !st.FencingGate {
+		return // fence_state is a new op; do not commit it to a mixed cluster
+	}
+	for name, n := range st.Nodes {
+		if n.Witness {
+			continue
+		}
+		hb, fresh := a.beat(name)
+		if !fresh {
+			continue
+		}
+		var loaded bool
+		switch hb.Fence {
+		case "armed", "expired":
+			loaded = true
+		case "inactive":
+			loaded = false
+		default:
+			continue // not checked yet (unknown, or the gate is not open on that node yet)
+		}
+		if loaded == n.FenceLoaded {
+			continue
+		}
+		if err := a.apply(fsm.Command{Op: "fence_state", Name: name, FenceLoaded: loaded, Time: time.Now().Unix()}); err != nil {
+			a.log.Warn("cannot commit fence_state", "node", name, "error", err)
+		}
+	}
+}
+
+// fenceBlocksFailover reports why an automatic failover must not run: the
+// primary's agent is unreachable and its fence worker was never confirmed
+// loaded, so nothing would stop the old PostgreSQL from accepting writes
+// after a standby is promoted.  An agent that is reachable keeps its own
+// PostgreSQL down, so a primary whose server crashed is not blocked.
+func fenceBlocksFailover(st fsm.State, primaryAgentFresh bool) string {
+	if !st.FencingGate || primaryAgentFresh {
+		return ""
+	}
+	if n := st.Nodes[st.Primary]; n != nil && !n.FenceLoaded {
+		return fmt.Sprintf("primary %s is unreachable and its fence worker was never confirmed loaded "+
+			"(worlber_ha not in shared_preload_libraries, or PostgreSQL not restarted since): "+
+			"automatic failover refused, it could leave two writable primaries.  "+
+			"If %s is really down, run SELECT worlber_ha.failover()", st.Primary, st.Primary)
+	}
+	return ""
 }
 
 // reconcileActualSync commits the set of standbys the running primary reports
@@ -270,6 +323,9 @@ func (a *Agent) checkPrimary() {
 	maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
 	name, why := PickCandidate(a.candidates(st), a.pickOptions(st, hb.Health.LSN, true))
 	_ = maxLag
+	if block := fenceBlocksFailover(st, fresh); block != "" {
+		name, why = "", block
+	}
 	if name == "" {
 		a.mu.Lock()
 		if time.Since(a.lastNoCand) > 60*time.Second {

@@ -142,3 +142,22 @@ func TestFencingGate(t *testing.T) {
 		t.Fatal("gate did not open on the right member set")
 	}
 }
+
+func TestFenceState(t *testing.T) {
+	f := New()
+	if err := applyCmd(t, f, Command{Op: "bootstrap", ClusterName: "prod", SystemID: "1", Node: &Node{Name: "pg1"}, OpenGate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if f.Get().Nodes["pg1"].FenceLoaded {
+		t.Fatal("a new node must not count as fenced")
+	}
+	if err := applyCmd(t, f, Command{Op: "fence_state", Name: "pg1", FenceLoaded: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.Get().Nodes["pg1"].FenceLoaded {
+		t.Fatal("fence_state not applied")
+	}
+	if err := applyCmd(t, f, Command{Op: "fence_state", Name: "nope", FenceLoaded: true}); err == nil {
+		t.Fatal("fence_state for an unknown node must fail")
+	}
+}

@@ -37,10 +37,11 @@ type leaseState struct {
 	confirmedNS  int64 // this node: send time of the last confirmed heartbeat
 	writtenTS    int64 // this node: timestamp in the lease file we last wrote
 	writtenTTL   time.Duration
-	fenceChecked bool // fence settings checked since PostgreSQL last started
-	fenceLoaded  bool // the fence worker library is loaded (shared_preload_libraries)
-	fenceGate    bool // the fencing gate state when the fence was last checked
-	fencing      bool // fencingLoop is stopping PostgreSQL
+	fenceChecked bool  // fence settings checked since PostgreSQL last started
+	fenceStart   int64 // postmaster start time the check was made for
+	fenceLoaded  bool  // the fence worker library is loaded (shared_preload_libraries)
+	fenceGate    bool  // the fencing gate state when the fence was last checked
+	fencing      bool  // fencingLoop is stopping PostgreSQL
 }
 
 func (a *Agent) leaseTTL(st fsm.State) time.Duration {
@@ -342,6 +343,10 @@ func childPIDs(pid int) []int {
 func (a *Agent) ensureFence(ctx context.Context, h pg.Health) {
 	gate := a.fsm.Get().FencingGate
 	a.mu.Lock()
+	if a.lease.fenceStart != h.StartedAt {
+		a.lease.fenceChecked = false // PostgreSQL restarted: shared_preload_libraries may differ
+		a.lease.fenceStart = h.StartedAt
+	}
 	done := a.lease.fenceChecked && a.lease.fenceGate == gate
 	a.mu.Unlock()
 	if done || !h.Running {

@@ -57,6 +57,12 @@ type Node struct {
 	Witness  bool   `json:"witness"`
 	AddedAt  int64  `json:"added_at"`
 	SlotName string `json:"slot_name"`
+	// FenceLoaded is true once the node's agent reported the fence worker
+	// loaded (worlber_ha in shared_preload_libraries).  Committed by the
+	// leader as it changes, so a new leader still knows it when this node's
+	// agent is gone: automatic failover away from a primary that never had
+	// a fence worker could leave two writable primaries.
+	FenceLoaded bool `json:"fence_loaded,omitempty"`
 }
 
 // Event is an entry in the cluster history (failovers, switchovers...).
@@ -127,6 +133,9 @@ type Command struct {
 
 	// actual_sync
 	SyncNodes []string `json:"sync_nodes,omitempty"`
+
+	// fence_state (Name, FenceLoaded)
+	FenceLoaded bool `json:"fence_loaded,omitempty"`
 
 	// open_gate
 	GateMembers []string `json:"gate_members,omitempty"`
@@ -410,6 +419,18 @@ func (s *State) apply(c Command) error {
 		}
 		s.ActualSync = append([]string(nil), c.SyncNodes...)
 		s.event(c.Time, "actual_sync", "", strings.Join(c.SyncNodes, ", "))
+
+	case "fence_state":
+		n, ok := s.Nodes[c.Name]
+		if !ok {
+			return fmt.Errorf("fence_state names unknown node %q", c.Name)
+		}
+		n.FenceLoaded = c.FenceLoaded
+		if c.FenceLoaded {
+			s.event(c.Time, "fence_loaded", c.Name, "fence worker loaded")
+		} else {
+			s.event(c.Time, "fence_not_loaded", c.Name, "worlber_ha is not in shared_preload_libraries; no automatic failover away from this node while it is primary")
+		}
 
 	default:
 		return fmt.Errorf("unknown op %q", c.Op)
