@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,9 +31,19 @@ const (
 // Cluster options and their defaults.
 var DefaultConfig = map[string]string{
 	"failover_timeout":        "30s",
+	"async_failover":          "never",
+	"ro_max_lag":              "0",
+	"ro_fallback":             "primary",
 	"maximum_lag_on_failover": "16MB",
 	"synchronous_mode":        "available", // available | strict
 	"paused":                  "false",
+	// WAL the primary keeps for a disconnected standby before giving up on
+	// it (max_slot_wal_keep_size); protects the primary's disk
+	"max_slot_wal_keep": "100GB",
+	// re-seed a standby automatically when the WAL it needs is gone
+	"auto_reinit": "true",
+	// pg_basebackup --max-rate when seeding (e.g. '100M'); empty = unlimited
+	"seed_max_rate": "",
 }
 
 // Node is one member of the cluster.
@@ -45,6 +57,12 @@ type Node struct {
 	Witness  bool   `json:"witness"`
 	AddedAt  int64  `json:"added_at"`
 	SlotName string `json:"slot_name"`
+	// FenceLoaded is true once the node's agent reported the fence worker
+	// loaded (worlber_ha in shared_preload_libraries).  Committed by the
+	// leader as it changes, so a new leader still knows it when this node's
+	// agent is gone: automatic failover away from a primary that never had
+	// a fence worker could leave two writable primaries.
+	FenceLoaded bool `json:"fence_loaded,omitempty"`
 }
 
 // Event is an entry in the cluster history (failovers, switchovers...).
@@ -67,6 +85,30 @@ type State struct {
 	Nodes        map[string]*Node  `json:"nodes"`
 	Config       map[string]string `json:"config"`
 	Events       []Event           `json:"events"`
+	// ActualSync is the set of standbys the running primary last reported as
+	// synchronous (sync_state sync/quorum).  It is the only set that is
+	// guaranteed to hold every acknowledged commit, so automatic failover
+	// promotes from it.  Committed by the leader as it changes, so a new
+	// leader still knows it.
+	ActualSync []string `json:"actual_sync,omitempty"`
+	// FencingGate is true once every member runs an agent that understands
+	// leases, confirmations and actual_sync.  Until then the cluster keeps
+	// the older behaviour (quorum-loss fencing only, best-eligible failover)
+	// so a rolling upgrade never self-fences a healthy node or diverges the
+	// FSM with ops an old agent cannot apply.  A cluster created at this
+	// version opens the gate at bootstrap.
+	FencingGate bool `json:"fencing_gate,omitempty"`
+	// JoinTokens are the outstanding one-time join tokens (only the nonce
+	// hash is kept).  Expired or consumed-and-old entries are pruned.
+	JoinTokens []JoinToken `json:"join_tokens,omitempty"`
+}
+
+// JoinToken is a stored one-time join token.
+type JoinToken struct {
+	Hash      string `json:"hash"`
+	Expiry    int64  `json:"exp"`
+	Sync      bool   `json:"sync"`
+	ClaimedBy string `json:"claimed_by,omitempty"`
 }
 
 // Command is a state change committed through Raft.
@@ -88,6 +130,24 @@ type Command struct {
 
 	// set_sync
 	Sync bool `json:"sync,omitempty"`
+
+	// actual_sync
+	SyncNodes []string `json:"sync_nodes,omitempty"`
+
+	// fence_state (Name, FenceLoaded)
+	FenceLoaded bool `json:"fence_loaded,omitempty"`
+
+	// open_gate
+	GateMembers []string `json:"gate_members,omitempty"`
+	// bootstrap: set by fencing-aware agents.  A bootstrap entry written by
+	// an older agent lacks it, so replaying an old log keeps the gate closed
+	// exactly as the older agents see it.
+	OpenGate bool `json:"open_gate,omitempty"`
+
+	// join_token / consume_join_token
+	TokenHash string `json:"token_hash,omitempty"`
+	Expiry    int64  `json:"expiry,omitempty"`
+	ClaimedBy string `json:"claimed_by,omitempty"`
 
 	// event
 	Kind   string `json:"kind,omitempty"`
@@ -228,6 +288,7 @@ func (s *State) apply(c Command) error {
 		s.Nodes[c.Node.Name] = c.Node
 		s.Primary = c.Node.Name
 		s.Epoch = 1
+		s.FencingGate = c.OpenGate
 		s.event(c.Time, "cluster_created", c.Node.Name, "cluster "+c.ClusterName+" created")
 
 	case "add_node":
@@ -273,7 +334,11 @@ func (s *State) apply(c Command) error {
 		old := s.Primary
 		s.Primary = c.Name
 		s.Epoch++
-		s.event(c.Time, c.Reason, c.Name, fmt.Sprintf("old primary %s", old))
+		detail := fmt.Sprintf("old primary %s", old)
+		if c.Detail != "" {
+			detail += "; " + c.Detail
+		}
+		s.event(c.Time, c.Reason, c.Name, detail)
 
 	case "set_sync":
 		n, ok := s.Nodes[c.Name]
@@ -297,6 +362,75 @@ func (s *State) apply(c Command) error {
 			return fmt.Errorf("event requires a kind")
 		}
 		s.event(c.Time, c.Kind, c.Name, c.Detail)
+
+	case "open_gate":
+		if s.FencingGate {
+			return nil // already open
+		}
+		// Deterministic guard: the member set the leader checked must match
+		// the committed set, so a node added between the check and the commit
+		// cannot be left behind an open gate.
+		have := make(map[string]bool, len(s.Nodes))
+		for n := range s.Nodes {
+			have[n] = true
+		}
+		if len(c.GateMembers) != len(have) {
+			return fmt.Errorf("open_gate member set does not match the cluster")
+		}
+		for _, n := range c.GateMembers {
+			if !have[n] {
+				return fmt.Errorf("open_gate names unknown member %q", n)
+			}
+		}
+		s.FencingGate = true
+		s.event(c.Time, "fencing_gate_open", "", "all members run the fencing agent")
+
+	case "join_token":
+		// prune expired/consumed tokens, then add the new one
+		kept := s.JoinTokens[:0]
+		for _, jt := range s.JoinTokens {
+			if jt.Expiry >= c.Time && jt.ClaimedBy == "" {
+				kept = append(kept, jt)
+			}
+		}
+		s.JoinTokens = append(kept, JoinToken{Hash: c.TokenHash, Expiry: c.Expiry, Sync: c.Sync})
+		s.event(c.Time, "join_token_created", "", "a one-time join token was issued")
+
+	case "consume_join_token":
+		found := false
+		for i := range s.JoinTokens {
+			if s.JoinTokens[i].Hash == c.TokenHash {
+				if s.JoinTokens[i].ClaimedBy != "" && s.JoinTokens[i].ClaimedBy != c.ClaimedBy {
+					return fmt.Errorf("join token already used")
+				}
+				s.JoinTokens[i].ClaimedBy = c.ClaimedBy
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("unknown join token")
+		}
+
+	case "actual_sync":
+		for _, n := range c.SyncNodes {
+			if _, ok := s.Nodes[n]; !ok {
+				return fmt.Errorf("actual_sync names unknown node %q", n)
+			}
+		}
+		s.ActualSync = append([]string(nil), c.SyncNodes...)
+		s.event(c.Time, "actual_sync", "", strings.Join(c.SyncNodes, ", "))
+
+	case "fence_state":
+		n, ok := s.Nodes[c.Name]
+		if !ok {
+			return fmt.Errorf("fence_state names unknown node %q", c.Name)
+		}
+		n.FenceLoaded = c.FenceLoaded
+		if c.FenceLoaded {
+			s.event(c.Time, "fence_loaded", c.Name, "fence worker loaded")
+		} else {
+			s.event(c.Time, "fence_not_loaded", c.Name, "worlber_ha is not in shared_preload_libraries; no automatic failover away from this node while it is primary")
+		}
 
 	default:
 		return fmt.Errorf("unknown op %q", c.Op)
@@ -323,19 +457,47 @@ func ValidateOption(key, value string) error {
 		if _, err := ParseBytes(value); err != nil {
 			return err
 		}
+	case "async_failover":
+		if value != "never" && value != "within_lag" {
+			return fmt.Errorf("async_failover must be 'never' or 'within_lag'")
+		}
+	case "ro_max_lag":
+		if _, err := ParseBytes(value); err != nil {
+			return err
+		}
+	case "ro_fallback":
+		if value != "primary" && value != "none" {
+			return fmt.Errorf("ro_fallback must be 'primary' or 'none'")
+		}
+	case "wal_archive_dir":
+		// validated more strictly in the agent (validateArchiveDir)
+	case "archive_keep":
+		// a duration like 7d / 168h; checked at prune time
 	case "synchronous_mode":
 		if value != "available" && value != "strict" {
 			return fmt.Errorf("synchronous_mode must be 'available' or 'strict'")
 		}
-	case "paused":
+	case "paused", "auto_reinit":
 		if value != "true" && value != "false" {
-			return fmt.Errorf("paused must be 'true' or 'false'")
+			return fmt.Errorf("%s must be 'true' or 'false'", key)
+		}
+	case "max_slot_wal_keep":
+		if value != "unlimited" {
+			if n, err := ParseBytes(value); err != nil || n < 1<<20 {
+				return fmt.Errorf("max_slot_wal_keep must be a size >= 1MB (e.g. '100GB') or 'unlimited'")
+			}
+		}
+	case "seed_max_rate":
+		if value != "" && !rateRe.MatchString(value) {
+			return fmt.Errorf("seed_max_rate must be like '50M' or '512k' (per second), or '' for unlimited")
 		}
 	default:
 		return fmt.Errorf("unknown option %q", key)
 	}
 	return nil
 }
+
+var rateRe = regexp.MustCompile(`^[0-9]+[kM]$`)
 
 // ParseBytes parses sizes like "16MB", "1GB", "0", "1048576".
 func ParseBytes(v string) (uint64, error) {

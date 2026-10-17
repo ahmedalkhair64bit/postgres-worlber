@@ -21,7 +21,7 @@ import (
 	"github.com/worlber/worlber-ha-agent/internal/pg"
 )
 
-var version = "1.0.0"
+var version = "1.2.0" // set by the release build: -ldflags "-X main.version=..."
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -38,6 +38,10 @@ func envInt(key string, def int) int {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		runInit(os.Args[2:])
+		return
+	}
 	host, _ := os.Hostname()
 	var (
 		name        = flag.String("name", env("WORLBER_HA_NAME", host), "unique node name")

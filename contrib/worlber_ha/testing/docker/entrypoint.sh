@@ -12,6 +12,8 @@ STATE=/var/lib/worlber_ha
 
 mkdir -p "$SOCKDIR" "$STATE" "$(dirname "$PGDATA")"
 chown postgres:postgres "$SOCKDIR" "$STATE" "$(dirname "$PGDATA")"
+# shared WAL archive (W6), present only when the compose mounts it
+[ -d /mnt/wal-archive ] && chown postgres:postgres /mnt/wal-archive || true
 chmod 2775 "$SOCKDIR"
 
 as_pg() { runuser -u postgres -- "$@"; }
@@ -30,6 +32,9 @@ unix_socket_directories = '$SOCKDIR'
 wal_keep_size = '256MB'
 log_destination = 'stderr'
 logging_collector = off
+# fence worker: stops this server if it is primary and its agent stopped
+# confirming it with the cluster (worlber_ha.fence is turned on by the agent)
+shared_preload_libraries = 'worlber_ha'
 CONF
     # application access from the lab network (and the docker host)
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
@@ -40,11 +45,18 @@ fi
 # container, so stop it cleanly after the agent ends.
 # With a VIP the agent needs CAP_NET_ADMIN/CAP_NET_RAW (ip addr, arping):
 # pass them as ambient capabilities to the unprivileged agent.
+# Chaos S9 (rolling upgrade): a binary at $STATE/override/worlber-ha-agent replaces the
+# image's agent, so a scenario can run an older or newer agent per node.
+AGENT=worlber-ha-agent
+if [ -x "$STATE/override/worlber-ha-agent" ]; then
+    AGENT=$STATE/override/worlber-ha-agent
+    echo "entrypoint: using $AGENT ($("$AGENT" --version 2>&1 | head -1))"
+fi
 caps=()
 if [ -n "${VIP:-}" ]; then
     caps=(--inh-caps=+net_admin,+net_raw --ambient-caps=+net_admin,+net_raw)
 fi
-setpriv --reuid=postgres --regid=postgres --init-groups "${caps[@]}" -- worlber-ha-agent \
+setpriv --reuid=postgres --regid=postgres --init-groups "${caps[@]}" -- "$AGENT" \
     --name "$NODE_NAME" \
     --token "$WORLBER_HA_TOKEN" \
     --data-dir "$STATE" \
@@ -64,6 +76,13 @@ agent=$!
 trap 'kill -TERM $agent 2>/dev/null' TERM INT
 wait $agent || true
 wait $agent 2>/dev/null || true
+if [ "${CHAOS_KEEP_PG:-0}" = "1" ]; then
+    # Chaos scenario S2: behave like production systemd (KillMode=process)
+    # with an agent that does not come back: PostgreSQL keeps running.
+    echo "entrypoint: agent ended; CHAOS_KEEP_PG=1 keeps PostgreSQL running"
+    trap 'exit 0' TERM INT
+    while :; do sleep 1; done
+fi
 if as_pg pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
     echo "entrypoint: agent ended, stopping PostgreSQL"
     as_pg pg_ctl -D "$PGDATA" stop -m fast -w -t 25 || true

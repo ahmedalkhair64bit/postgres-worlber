@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
 	"github.com/worlber/worlber-ha-agent/internal/pg"
+	"github.com/worlber/worlber-ha-agent/internal/safety"
 )
 
 // localOps run on the agent that received the call; everything else is
@@ -26,7 +28,8 @@ var localOps = map[string]bool{"create_cluster": true, "events": true, "config":
 var leaderOps = map[string]bool{
 	"status": true, "add_node": true, "remove_node": true, "set_sync": true,
 	"set_config": true, "switchover": true, "failover": true,
-	"replication": true, "record_event": true,
+	"replication": true, "record_event": true, "reinit_node": true, "verify_table": true,
+	"join_token": true, "join_consume": true, "drill": true,
 }
 
 // execute dispatches a request from the SQL extension.
@@ -53,7 +56,7 @@ func (a *Agent) execute(ctx context.Context, op string, args json.RawMessage) (o
 		}
 		var rep reply
 		timeout := 30 * time.Second
-		if op == "add_node" || op == "switchover" {
+		if op == "add_node" || op == "switchover" || op == "drill" {
 			timeout = 15 * time.Minute
 		}
 		if err := a.peerPostTimeout(ctx, addr, "/peer/op/"+op, args, &rep, timeout); err != nil {
@@ -110,8 +113,34 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	switch op {
 	case "status":
 		return opResult{Result: a.buildStatus(a.fsm.Get(), false)}, nil
+	case "join_token":
+		return a.joinToken(ctx, args)
+	case "drill":
+		var req struct {
+			Kind string `json:"kind"`
+			DB   string `json:"dbname"`
+		}
+		_ = json.Unmarshal(args, &req)
+		return a.drill(ctx, req.Kind, req.DB)
+	case "join_consume":
+		var req joinRequest
+		if err := json.Unmarshal(args, &req); err != nil {
+			return opResult{}, err
+		}
+		return a.consumeJoin(ctx, req)
 	case "replication":
 		return opResult{Result: a.replicationStatus(a.fsm.Get())}, nil
+	case "reinit_node":
+		var req struct{ Name string }
+		_ = json.Unmarshal(args, &req)
+		return a.reinitNode(ctx, req.Name)
+	case "verify_table":
+		var req struct {
+			Table string `json:"table"`
+			DB    string `json:"dbname"`
+		}
+		_ = json.Unmarshal(args, &req)
+		return a.verifyTable(ctx, req.DB, req.Table)
 	case "record_event":
 		var c fsm.Command
 		if err := json.Unmarshal(args, &c); err != nil {
@@ -140,7 +169,7 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	case "set_config":
 		var req struct{ Key, Value string }
 		_ = json.Unmarshal(args, &req)
-		if err := fsm.ValidateOption(req.Key, req.Value); err != nil {
+		if err := validateNewOption(req.Key, req.Value); err != nil {
 			return opResult{}, err
 		}
 		return opResult{Result: "ok"}, a.apply(fsm.Command{Op: "set_config", Key: req.Key, Value: req.Value})
@@ -190,7 +219,7 @@ func (a *Agent) createCluster(ctx context.Context, args json.RawMessage) (opResu
 	}
 	for k, v := range map[string]string{"synchronous_mode": req.SynchronousMode, "failover_timeout": req.FailoverTimeout} {
 		if v != "" {
-			if err := fsm.ValidateOption(k, v); err != nil {
+			if err := validateNewOption(k, v); err != nil {
 				return opResult{}, err
 			}
 		}
@@ -254,7 +283,7 @@ func (a *Agent) createCluster(ctx context.Context, args json.RawMessage) (opResu
 	node := &fsm.Node{Name: a.cfg.Name, PGHost: a.cfg.PGAdvertise, PGPort: a.cfg.PG.Port,
 		APIAddr: a.cfg.APIAddr, RaftAddr: a.cfg.RaftAddr}
 	if err := a.apply(fsm.Command{Op: "bootstrap", ClusterName: req.Name, SystemID: sysid,
-		ReplUser: a.cfg.ReplUser, ReplPassword: pw, Node: node}); err != nil {
+		ReplUser: a.cfg.ReplUser, ReplPassword: pw, Node: node, OpenGate: true}); err != nil {
 		return opResult{}, err
 	}
 	for k, v := range map[string]string{"synchronous_mode": req.SynchronousMode, "failover_timeout": req.FailoverTimeout} {
@@ -450,12 +479,24 @@ func (a *Agent) removeNode(ctx context.Context, name string) (opResult, error) {
 // candidates returns failover candidates from the leader's heartbeats.
 func (a *Agent) candidates(st fsm.State) []Candidate {
 	var out []Candidate
+	// Prefer the standby the primary actually used as synchronous; the sync
+	// flag is only a preference and may name the primary itself.  Without a
+	// report from the running primary (new leader), fall back to the flag.
+	seen, known := a.lastSync(st.Primary, st.Epoch)
+	inActual := map[string]bool{}
+	for _, n := range st.ActualSync {
+		inActual[n] = true
+	}
 	for _, n := range st.SortedNodes() {
 		if n.Name == st.Primary || n.Witness {
 			continue
 		}
 		hb, fresh := a.beat(n.Name)
-		out = append(out, Candidate{Name: n.Name, Sync: n.Sync, Fresh: fresh,
+		sync := n.Sync
+		if known {
+			sync = seen[n.Name]
+		}
+		out = append(out, Candidate{Name: n.Name, Sync: sync, InActualSync: inActual[n.Name], Fresh: fresh,
 			Running: hb.Health.Running, InRecovery: hb.Health.InRecovery, LSN: hb.Health.LSN})
 	}
 	return out
@@ -475,9 +516,8 @@ func (a *Agent) switchover(ctx context.Context, target string) (opResult, error)
 		return opResult{}, errHint("Run SELECT worlber_ha.resume() first.", "cluster is paused")
 	}
 	if target == "" {
-		maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
 		phb, _ := a.beat(st.Primary)
-		name, why := PickCandidate(a.candidates(st), phb.Health.LSN, maxLag, false)
+		name, why := PickCandidate(a.candidates(st), a.pickOptions(st, phb.Health.LSN, false))
 		if name == "" {
 			return opResult{}, fmt.Errorf("no switchover candidate: %s", why)
 		}
@@ -533,7 +573,8 @@ func (a *Agent) switchover(ctx context.Context, target string) (opResult, error)
 	}
 
 	// 3. commit the new primary; agents promote and re-point standbys.
-	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "switchover"}); err != nil {
+	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "switchover",
+		Detail: "no data loss: " + target + " replayed the old primary's shutdown checkpoint " + stop.CheckpointLSN}); err != nil {
 		a.releaseHold(ctx, old)
 		return opResult{}, err
 	}
@@ -592,12 +633,12 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 			"primary %q is healthy", st.Primary)
 	}
 	if target == "" {
-		maxLag := uint64(0)
-		if !force {
-			maxLag, _ = fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
-		}
 		phb, _ := a.beat(st.Primary)
-		name, why := PickCandidate(a.candidates(st), phb.Health.LSN, maxLag, false)
+		opts := a.pickOptions(st, phb.Health.LSN, false)
+		if force {
+			opts.MaxLag = 0
+		}
+		name, why := PickCandidate(a.candidates(st), opts)
 		if name == "" {
 			return opResult{}, fmt.Errorf("no failover candidate: %s", why)
 		}
@@ -610,7 +651,20 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 	if hb, fresh := a.beat(target); !fresh || !hb.Health.Running {
 		return opResult{}, fmt.Errorf("target %q is not running", target)
 	}
-	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "manual_failover"}); err != nil {
+	// Stop confirming the old primary and wait until its lease is gone, so
+	// it cannot accept writes once the target is promoted.
+	for {
+		ok, left := a.beginFailover(st)
+		if ok {
+			break
+		}
+		a.log.Info("manual failover: waiting for the old primary's lease to expire", "left", left.Round(100*time.Millisecond))
+		time.Sleep(left)
+	}
+	phb, _ := a.beat(st.Primary)
+	if err := a.apply(fsm.Command{Op: "set_primary", Name: target, ExpectedEpoch: st.Epoch, Reason: "manual_failover",
+		Detail: a.lossEstimate(st, target, phb) + "; old primary fenced (lease expired)"}); err != nil {
+		a.abortFailover()
 		return opResult{}, err
 	}
 	return opResult{Result: map[string]any{"old_primary": st.Primary, "new_primary": target}}, nil
@@ -618,20 +672,23 @@ func (a *Agent) manualFailover(target string, force bool) (opResult, error) {
 
 // nodeStatus is one row of worlber_ha.cluster_status.
 type nodeStatus struct {
-	Node       string `json:"node"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	Role       string `json:"role"`
-	State      string `json:"state"`
-	Timeline   int    `json:"timeline"`
-	LSN        string `json:"lsn,omitempty"`
-	ReplayLSN  string `json:"replay_lsn,omitempty"`
-	LagBytes   *int64 `json:"lag_bytes"`
-	Sync       bool   `json:"sync"`
-	SyncState  string `json:"sync_state"`
-	RaftRole   string `json:"raft_role"`
-	LastSeenMs *int64 `json:"last_seen_ms"`
-	Agent      string `json:"agent_status"`
+	Node       string      `json:"node"`
+	Host       string      `json:"host"`
+	Port       int         `json:"port"`
+	Role       string      `json:"role"`
+	State      string      `json:"state"`
+	Timeline   int         `json:"timeline"`
+	LSN        string      `json:"lsn,omitempty"`
+	ReplayLSN  string      `json:"replay_lsn,omitempty"`
+	LagBytes   *int64      `json:"lag_bytes"`
+	Sync       bool        `json:"sync"`
+	SyncState  string      `json:"sync_state"`
+	RaftRole   string      `json:"raft_role"`
+	LastSeenMs *int64      `json:"last_seen_ms"`
+	Agent      string      `json:"agent_status"`
+	Fence      string      `json:"fence_state,omitempty"`
+	LeaseAge   *float64    `json:"lease_age_s,omitempty"`
+	Archive    *archiveRow `json:"archive,omitempty"`
 }
 
 func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
@@ -645,7 +702,7 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 	}
 	if localOnly {
 		a.mu.Lock()
-		a.beats[a.cfg.Name] = heartbeat{Node: a.cfg.Name, Health: a.local, Status: a.status, At: time.Now()}
+		a.storeBeatLocked(heartbeat{Node: a.cfg.Name, Health: a.local, Status: a.status, Epoch: st.Epoch, Version: AgentVersion, At: time.Now()})
 		a.mu.Unlock()
 	}
 	phb, _ := a.beat(st.Primary)
@@ -670,6 +727,9 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 			ns.LastSeenMs = &ms
 		}
 		ns.Agent = hb.Status
+		if fresh {
+			ns.Fence, ns.LeaseAge, ns.Archive = hb.Fence, hb.LeaseAge, hb.Archive
+		}
 		h := hb.Health
 		switch {
 		case n.Witness:
@@ -718,7 +778,7 @@ func (a *Agent) buildStatus(st fsm.State, localOnly bool) map[string]any {
 	})
 	return map[string]any{
 		"cluster": st.ClusterName, "primary": st.Primary, "epoch": st.Epoch,
-		"leader": string(leaderID), "paused": st.Paused(), "nodes": rows,
+		"leader": string(leaderID), "paused": st.Paused(), "fencing_gate": st.FencingGate, "nodes": rows,
 	}
 }
 
@@ -767,4 +827,168 @@ func (a *Agent) replicationStatus(st fsm.State) []replicationRow {
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Node < rows[j].Node })
 	return rows
+}
+
+// reinitNode asks a standby to wipe its data and re-seed from the primary.
+func (a *Agent) reinitNode(ctx context.Context, name string) (opResult, error) {
+	st := a.fsm.Get()
+	n, ok := st.Nodes[name]
+	if !ok {
+		return opResult{}, fmt.Errorf("node %q is not a member", name)
+	}
+	if n.Witness {
+		return opResult{}, fmt.Errorf("node %q is a witness", name)
+	}
+	if st.Primary == name {
+		return opResult{}, errHint("Switch over to another node first.", "cannot re-initialize the primary %q", name)
+	}
+	if err := a.peerPost(ctx, n.APIAddr, "/peer/reinit", map[string]string{"reason": "requested with reinit_node()"}, nil); err != nil {
+		return opResult{}, err
+	}
+	return opResult{Result: map[string]any{"node": name, "state": "re-seeding",
+		"follow": "SELECT node, state, agent_status FROM worlber_ha.cluster_status"}}, nil
+}
+
+// fingerprint is the checksum of one table on one node.
+type fingerprint struct {
+	Node    string `json:"node"`
+	Role    string `json:"role"`
+	LSN     string `json:"lsn"`
+	Rows    int64  `json:"rows"`
+	MD5     string `json:"md5"`
+	Matches *bool  `json:"matches_primary"`
+	Error   string `json:"error,omitempty"`
+}
+
+// verifyTable computes the checksum of a table on the primary, then on each
+// standby once it has replayed up to the primary's LSN, and compares them.
+func (a *Agent) verifyTable(ctx context.Context, db, table string) (opResult, error) {
+	if table == "" {
+		return opResult{}, fmt.Errorf("table is required")
+	}
+	if db == "" {
+		db = "postgres"
+	}
+	st := a.fsm.Get()
+	ask := func(n *fsm.Node, wait string) fingerprint {
+		var fp fingerprint
+		req := map[string]string{"dbname": db, "table": table, "wait_lsn": wait}
+		var err error
+		if n.Name == a.cfg.Name {
+			fp, err = a.localFingerprint(ctx, db, table, wait)
+		} else {
+			err = a.peerPostTimeout(ctx, n.APIAddr, "/peer/fingerprint", req, &fp, 10*time.Minute)
+		}
+		fp.Node, fp.Role = n.Name, st.RoleOf(n.Name)
+		if err != nil {
+			fp.Error = err.Error()
+		}
+		return fp
+	}
+	primary := ask(st.Nodes[st.Primary], "")
+	if primary.Error != "" {
+		return opResult{}, fmt.Errorf("on primary %s: %s", st.Primary, primary.Error)
+	}
+	t := true
+	primary.Matches = &t
+	out := []fingerprint{primary}
+	ch := make(chan fingerprint)
+	count := 0
+	for _, n := range st.SortedNodes() {
+		if n.Name == st.Primary || n.Witness {
+			continue
+		}
+		count++
+		go func(n *fsm.Node) { ch <- ask(n, primary.LSN) }(n)
+	}
+	for i := 0; i < count; i++ {
+		fp := <-ch
+		if fp.Error == "" {
+			m := fp.MD5 == primary.MD5 && fp.Rows == primary.Rows
+			fp.Matches = &m
+		}
+		out = append(out, fp)
+	}
+	sort.Slice(out[1:], func(i, j int) bool { return out[1+i].Node < out[1+j].Node })
+	return opResult{Result: out}, nil
+}
+
+// localFingerprint checksums a table on the local server, after waiting
+// until it has replayed waitLSN (standbys).
+func (a *Agent) localFingerprint(ctx context.Context, db, table, waitLSN string) (fingerprint, error) {
+	var fp fingerprint
+	parts := strings.Split(table, ".")
+	if len(parts) > 2 {
+		return fp, fmt.Errorf("invalid table name %q", table)
+	}
+	ident := pgx.Identifier(parts).Sanitize()
+	cfg, err := pgx.ParseConfig(pg.ConnInfo("host", a.pg.SocketDir, "port", fmt.Sprint(a.pg.Port), "user", a.pg.User,
+		"dbname", db, "connect_timeout", "5", "application_name", "worlber_ha_verify"))
+	if err != nil {
+		return fp, err
+	}
+	c, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fp, err
+	}
+	defer c.Close(context.Background())
+	if waitLSN != "" {
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			var ok bool
+			if err := c.QueryRow(ctx, "SELECT coalesce(pg_last_wal_replay_lsn() >= $1::pg_lsn, true)", waitLSN).Scan(&ok); err != nil {
+				return fp, err
+			}
+			if ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fp, fmt.Errorf("did not replay up to %s within 60s", waitLSN)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	tx, err := c.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return fp, err
+	}
+	defer tx.Rollback(context.Background())
+	err = tx.QueryRow(ctx, `SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END::text,
+	        count(*), coalesce(md5(string_agg(md5(t::text), '' ORDER BY md5(t::text))), md5(''))
+	        FROM `+ident+` t`).Scan(&fp.LSN, &fp.Rows, &fp.MD5)
+	return fp, err
+}
+
+// validateNewOption checks an option set by a DBA now.  It may be stricter
+// than fsm.ValidateOption, which must keep accepting what older versions
+// committed to the Raft log.
+func validateNewOption(key, value string) error {
+	if err := fsm.ValidateOption(key, value); err != nil {
+		return err
+	}
+	if key == "wal_archive_dir" {
+		return validateArchiveDir(value)
+	}
+	if key == "failover_timeout" {
+		if d, _ := time.ParseDuration(value); d < safety.MinFailoverTimeout {
+			return fmt.Errorf("failover_timeout must be at least %s: the old primary's lease must expire before a standby is promoted", safety.MinFailoverTimeout)
+		}
+	}
+	return nil
+}
+
+// pickOptions builds the failover selection options from the cluster state.
+func (a *Agent) pickOptions(st fsm.State, primaryLSN uint64, automatic bool) PickOptions {
+	maxLag, _ := fsm.ParseBytes(st.Option("maximum_lag_on_failover"))
+	return PickOptions{
+		PrimaryLSN: primaryLSN,
+		MaxLag:     maxLag,
+		Strict:     st.Option("synchronous_mode") == "strict",
+		// Before the fencing gate opens (rolling upgrade), there is no
+		// actual_sync set to rely on, so fail over like the older agent:
+		// best eligible standby.
+		Automatic:     automatic && st.FencingGate,
+		HasActualSync: len(st.ActualSync) > 0,
+		Async:         st.Option("async_failover"),
+	}
 }

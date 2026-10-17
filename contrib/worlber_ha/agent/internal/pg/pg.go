@@ -56,6 +56,9 @@ type Health struct {
 	WalReceiver string        `json:"wal_receiver"`
 	Replicas    []ReplicaStat `json:"replicas,omitempty"`
 	Error       string        `json:"error,omitempty"`
+	// StartedAt is pg_postmaster_start_time() in microseconds: it changes
+	// on every restart, even one too quick to be seen as "not running".
+	StartedAt int64 `json:"started_at,omitempty"`
 }
 
 func (l *Local) bin(name string) string {
@@ -169,8 +172,9 @@ func (l *Local) Probe(ctx context.Context) Health {
 		            THEN coalesce((SELECT received_tli FROM pg_stat_wal_receiver),
 		                          (SELECT timeline_id FROM pg_control_checkpoint()))
 		            ELSE ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int END,
-		       (SELECT status FROM pg_stat_wal_receiver)`).
-		Scan(&h.InRecovery, &lsn, &replay, &tli, &wr)
+		       (SELECT status FROM pg_stat_wal_receiver),
+		       (extract(epoch FROM pg_postmaster_start_time()) * 1000000)::bigint`).
+		Scan(&h.InRecovery, &lsn, &replay, &tli, &wr, &h.StartedAt)
 	if err != nil {
 		if c.IsClosed() {
 			l.dropConn()
@@ -328,7 +332,7 @@ func (l *Local) ControlData(ctx context.Context) (map[string]string, error) {
 }
 
 // BaseBackup clones a primary into the (empty) PGDATA.
-func (l *Local) BaseBackup(ctx context.Context, conninfo, password, slot string) error {
+func (l *Local) BaseBackup(ctx context.Context, conninfo, password, slot, maxRate string) error {
 	if err := os.MkdirAll(l.PGData, 0700); err != nil {
 		return err
 	}
@@ -337,6 +341,9 @@ func (l *Local) BaseBackup(ctx context.Context, conninfo, password, slot string)
 	args := []string{"-D", l.PGData, "-d", conninfo, "-X", "stream", "-c", "fast", "-R", "--no-password"}
 	if slot != "" {
 		args = append(args, "-S", slot)
+	}
+	if maxRate != "" {
+		args = append(args, "--max-rate", maxRate)
 	}
 	_, err := l.run(ctx, env, "pg_basebackup", args...)
 	return err

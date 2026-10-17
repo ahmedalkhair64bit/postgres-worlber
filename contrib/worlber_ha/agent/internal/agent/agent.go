@@ -22,6 +22,7 @@ import (
 
 	"github.com/worlber/worlber-ha-agent/internal/fsm"
 	"github.com/worlber/worlber-ha-agent/internal/pg"
+	"github.com/worlber/worlber-ha-agent/internal/safety"
 )
 
 // Config is the static configuration of one agent.
@@ -50,12 +51,24 @@ type Config struct {
 
 // heartbeat is what each agent reports to the leader every tick.
 type heartbeat struct {
-	Node   string    `json:"node"`
-	Health pg.Health `json:"health"`
-	Status string    `json:"status"`
-	Epoch  uint64    `json:"epoch"`
-	At     time.Time `json:"-"`
+	Node    string    `json:"node"`
+	Health  pg.Health `json:"health"`
+	Status  string    `json:"status"`
+	Epoch   uint64    `json:"epoch"`
+	Version int       `json:"version"`
+	// fencing and archiving state, shown in cluster_status / health_check
+	Fence    string      `json:"fence,omitempty"`
+	LeaseAge *float64    `json:"lease_age_s,omitempty"`
+	Archive  *archiveRow `json:"archive,omitempty"`
+	// ExtVersion is the installed worlber_ha extension version, reported by
+	// the primary ("absent" when it is not installed in the agent's database).
+	ExtVersion string    `json:"ext_version,omitempty"`
+	At         time.Time `json:"-"`
 }
+
+// AgentVersion is the agent's protocol version.  1 (or absent) is the
+// pre-fencing agent; 2 understands leases, confirmations and actual_sync.
+const AgentVersion = 2
 
 // Agent is a running node agent.
 type Agent struct {
@@ -66,28 +79,40 @@ type Agent struct {
 	pg   *pg.Local
 	http *http.Client
 
-	mu          sync.Mutex
-	beats       map[string]heartbeat // leader only
-	local       pg.Health
-	status      string
-	holdUntil   time.Time // don't start PostgreSQL as primary (switchover)
-	holdEpoch   uint64    // ... but only while the epoch is unchanged
-	needRewind  bool
-	noStreamAt  time.Time
-	quorumLost  time.Time
-	wasLeader   bool
-	leaderReady bool   // barrier done in this leadership term
-	readyTerm   string // ... namely this Raft term
-	leaderSince time.Time
-	primaryBad  time.Time
-	lastNoCand  time.Time
+	mu    sync.Mutex
+	beats map[string]heartbeat // leader only
+	// syncSeen: for each primary, the standbys it last reported in
+	// sync/quorum state while PostgreSQL was running (leader only).  A
+	// heartbeat from a crashed primary has no replica list and does not
+	// overwrite it.
+	syncSeen          map[string]syncView
+	local             pg.Health
+	status            string
+	holdUntil         time.Time // don't start PostgreSQL as primary (switchover)
+	holdEpoch         uint64    // ... but only while the epoch is unchanged
+	needRewind        bool
+	reinitReason      string // set by reinit_node: wipe and re-seed this standby
+	noStreamAt        time.Time
+	archiveProgressAt time.Time // last time replay advanced during archive catch-up
+	lastReplay        uint64
+	archiveFailing    bool // last archiver check on this primary failed
+	quorumLost        time.Time
+	wasLeader         bool
+	leaderReady       bool   // barrier done in this leadership term
+	readyTerm         string // ... namely this Raft term
+	leaderSince       time.Time
+	primaryBad        time.Time
+	lastNoCand        time.Time
+
+	lease leaseState // fencing (lease.go)
 
 	opMu sync.Mutex // serializes leader operations (switchover, failover...)
 
 	stop context.CancelFunc // ends Run (used when removed from the cluster)
 
-	logs   *logRing
-	router *router
+	logs        *logRing
+	router      *router
+	joinLimiter *rateLimiter
 
 	evMu      sync.Mutex    // protects pending (separate from mu: report() may be called with mu held)
 	pending   []fsm.Command // events waiting for delivery to the leader
@@ -119,12 +144,14 @@ func New(cfg Config) (*Agent, error) {
 		logs: ring,
 		log: hclog.New(&hclog.LoggerOptions{Name: "worlber-ha[" + cfg.Name + "]", Level: lvl,
 			IndependentLevels: true, Output: io.MultiWriter(os.Stderr, ring)}),
-		fsm:   fsm.New(),
-		pg:    cfg.PG,
-		http:  &http.Client{Timeout: 15 * time.Second},
-		beats: map[string]heartbeat{},
+		fsm:      fsm.New(),
+		pg:       cfg.PG,
+		http:     &http.Client{Timeout: 15 * time.Second},
+		beats:    map[string]heartbeat{},
+		syncSeen: map[string]syncView{},
 
-		eventKick: make(chan struct{}, 1),
+		eventKick:   make(chan struct{}, 1),
+		joinLimiter: newRateLimiter(5, time.Minute),
 	}
 	return a, nil
 }
@@ -223,12 +250,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent started", "raft", a.cfg.RaftAddr, "api", a.cfg.APIAddr, "socket", a.cfg.Socket, "witness", a.cfg.Witness)
 
 	var wg sync.WaitGroup
-	wg.Add(5)
-	go func() { defer wg.Done(); a.eventLoop(ctx) }()
-	go func() { defer wg.Done(); a.router.run(ctx) }()
-	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
-	go func() { defer wg.Done(); a.reconcileLoop(ctx) }()
-	go func() { defer wg.Done(); a.leaderLoop(ctx) }()
+	for _, loop := range []func(context.Context){
+		a.eventLoop, a.router.run, a.heartbeatLoop, a.reconcileLoop, a.leaderLoop,
+		a.verifyLoop, a.leaseLoop, a.fencingLoop, a.retentionLoop,
+	} {
+		wg.Add(1)
+		go func() { defer wg.Done(); loop(ctx) }()
+	}
 
 	<-ctx.Done()
 	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -251,6 +279,14 @@ func (a *Agent) setStatus(format string, args ...any) {
 	if changed && s != "" {
 		a.log.Info("status", "status", s)
 	}
+}
+
+// setStatusQuiet updates the status without logging (progress messages).
+func (a *Agent) setStatusQuiet(format string, args ...any) {
+	s := fmt.Sprintf(format, args...)
+	a.mu.Lock()
+	a.status = s
+	a.mu.Unlock()
 }
 
 func (a *Agent) isLeader() bool { return a.raft.State() == raft.Leader }
@@ -313,22 +349,48 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		}
 		a.mu.Lock()
 		a.local = h
-		hb := heartbeat{Node: a.cfg.Name, Health: h, Status: a.status, Epoch: a.fsm.Get().Epoch}
+		hb := heartbeat{Node: a.cfg.Name, Health: h, Status: a.status, Epoch: a.fsm.Get().Epoch, Version: AgentVersion}
 		a.mu.Unlock()
+		if !a.cfg.Witness {
+			hb.Fence, hb.LeaseAge = a.fenceState()
+			if h.Running && !h.InRecovery {
+				hb.Archive = a.archiveStatus(ctx)
+				hb.ExtVersion = a.extVersion(ctx)
+			}
+		}
 
 		st := a.fsm.Get()
 		if _, member := st.Nodes[a.cfg.Name]; !member {
 			continue
 		}
+		if !h.Running {
+			a.mu.Lock()
+			a.lease.fenceChecked = false // check the fence settings after the next start
+			a.mu.Unlock()
+		} else if !a.cfg.Witness {
+			a.ensureFence(ctx, h)
+		}
+		// The lease may only be stamped with the time this heartbeat was
+		// sent: the leader saw us no earlier than that.
+		sent := safety.BootTime()
 		if a.isLeader() {
 			a.recordBeat(hb)
+			if a.confirmFor(hb) {
+				a.setConfirmed(sent)
+			}
 			continue
 		}
 		addr, err := a.leaderAPI()
 		if err != nil {
 			continue
 		}
-		_ = a.peerPost(ctx, addr, "/peer/heartbeat", hb, nil)
+		var rep struct {
+			Confirm bool `json:"confirm"`
+		}
+		// A reply older than safety.Q is useless for the lease anyway.
+		if err := a.peerPostTimeout(ctx, addr, "/peer/heartbeat", hb, &rep, safety.Q); err == nil && rep.Confirm {
+			a.setConfirmed(sent)
+		}
 	}
 }
 
@@ -390,8 +452,42 @@ func (a *Agent) eventLoop(ctx context.Context) {
 func (a *Agent) recordBeat(hb heartbeat) {
 	hb.At = time.Now()
 	a.mu.Lock()
-	a.beats[hb.Node] = hb
+	a.storeBeatLocked(hb)
 	a.mu.Unlock()
+}
+
+// syncView is what a running primary last said about its standbys.
+type syncView struct {
+	epoch uint64
+	sync  map[string]bool // standbys in sync or quorum state
+	at    time.Time
+}
+
+// storeBeatLocked records a heartbeat; a.mu must be held.
+func (a *Agent) storeBeatLocked(hb heartbeat) {
+	a.beats[hb.Node] = hb
+	if hb.Health.Running && !hb.Health.InRecovery {
+		v := syncView{epoch: hb.Epoch, sync: map[string]bool{}, at: hb.At}
+		for _, r := range hb.Health.Replicas {
+			if r.SyncState == "sync" || r.SyncState == "quorum" {
+				v.sync[r.AppName] = true
+			}
+		}
+		a.syncSeen[hb.Node] = v
+	}
+}
+
+// lastSync returns the standbys the primary last reported as synchronous,
+// and false when this agent never saw a running heartbeat from it in the
+// current epoch (for example right after a leader change).
+func (a *Agent) lastSync(primary string, epoch uint64) (map[string]bool, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	v, ok := a.syncSeen[primary]
+	if !ok || v.epoch != epoch {
+		return nil, false
+	}
+	return v.sync, true
 }
 
 // beat returns the latest heartbeat of a node and whether it is fresh.

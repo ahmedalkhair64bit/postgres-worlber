@@ -3,10 +3,11 @@
 MODULE_big = worlber_ha
 OBJS = \
 	$(WIN32RES) \
+	fence.o \
 	worlber_ha.o
 
 EXTENSION = worlber_ha
-DATA = worlber_ha--1.0.sql worlber_ha--1.0--1.1.sql
+DATA = worlber_ha--1.0.sql worlber_ha--1.0--1.1.sql worlber_ha--1.1--1.2.sql
 PGFILEDESC = "worlber_ha - availability groups for PostgreSQL managed from SQL"
 
 REGRESS = worlber_ha

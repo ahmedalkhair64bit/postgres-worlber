@@ -19,10 +19,13 @@ ORDER BY 1;
  config
  connection_string
  create_cluster
+ drill
  event_log
  failover
  health_check
+ join_token
  pause
+ reinit_node
  remove_node
  replication_raw
  resume
@@ -30,7 +33,8 @@ ORDER BY 1;
  set_sync
  status
  switchover
-(20 rows)
+ verify_table
+(24 rows)
 
 SELECT c.relname, c.relkind
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -42,9 +46,10 @@ ORDER BY 1;
  cluster_config | v
  cluster_status | v
  events         | v
+ proof          | v
  redo           | v
  replication    | v
-(6 rows)
+(7 rows)
 
 -- management is restricted, monitoring is open to pg_monitor
 SELECT has_function_privilege('public', 'worlber_ha.switchover(text)', 'EXECUTE') AS public_switchover,
@@ -112,11 +117,11 @@ SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
  1.0
 (1 row)
 
-ALTER EXTENSION worlber_ha UPDATE TO '1.1';
+ALTER EXTENSION worlber_ha UPDATE TO '1.2';
 SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
  extversion 
 ------------
- 1.1
+ 1.2
 (1 row)
 
 SELECT count(*) AS blocked_sessions FROM worlber_ha.blocking;

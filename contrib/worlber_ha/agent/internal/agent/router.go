@@ -28,10 +28,11 @@ import (
 )
 
 type routeTable struct {
-	epoch    uint64
-	primary  string   // address of the primary
-	replicas []string // addresses of streaming standbys
-	at       time.Time
+	epoch      uint64
+	primary    string   // address of the primary
+	replicas   []string // read-only pool: standbys within ro_max_lag
+	roFallback bool     // read-only reads may fall back to the primary
+	at         time.Time
 }
 
 type router struct {
@@ -65,6 +66,18 @@ func dialPG(addr string) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, 3*time.Second)
 }
 
+// roEligible reports whether a standby may serve read-only traffic: it is a
+// streaming replica within ro_max_lag (0 = no limit).
+func roEligible(ns nodeStatus, maxLag uint64) bool {
+	if ns.Role != fsm.RoleReplica || ns.State != "streaming" {
+		return false
+	}
+	if maxLag > 0 && ns.LagBytes != nil && *ns.LagBytes > int64(maxLag) {
+		return false
+	}
+	return true
+}
+
 // run refreshes routing state, VIP and role hooks every tick.
 func (r *router) run(ctx context.Context) {
 	t := time.NewTicker(r.a.cfg.Tick)
@@ -96,6 +109,8 @@ func (r *router) refresh(ctx context.Context) {
 	var tbl routeTable
 	tbl.epoch = st.Epoch
 	tbl.at = time.Now()
+	tbl.roFallback = st.Option("ro_fallback") != "none"
+	roMaxLag, _ := fsm.ParseBytes(st.Option("ro_max_lag"))
 	// Never route writes while this agent cannot confirm the primary:
 	// during a partition the old primary may be fenced already.
 	if r.a.hasQuorum(st.Duration("failover_timeout") / 3) {
@@ -108,7 +123,7 @@ func (r *router) refresh(ctx context.Context) {
 		if m, ok := res.Result.(map[string]any); ok {
 			if rows, ok := m["nodes"].([]nodeStatus); ok {
 				for _, ns := range rows {
-					if ns.Role == fsm.RoleReplica && ns.State == "streaming" {
+					if roEligible(ns, roMaxLag) {
 						if n := st.Nodes[ns.Node]; n != nil {
 							tbl.replicas = append(tbl.replicas, pgAddr(n))
 						}
@@ -121,7 +136,7 @@ func (r *router) refresh(ctx context.Context) {
 			}
 			if json.Unmarshal(raw, &m) == nil {
 				for _, ns := range m.Nodes {
-					if ns.Role == fsm.RoleReplica && ns.State == "streaming" {
+					if roEligible(ns, roMaxLag) {
 						if n := st.Nodes[ns.Node]; n != nil {
 							tbl.replicas = append(tbl.replicas, pgAddr(n))
 						}
@@ -201,7 +216,10 @@ func (r *router) targets(readOnly bool) ([]string, uint64) {
 			out = append(out, r.table.replicas[(start+i)%n])
 		}
 	}
-	if r.table.primary != "" {
+	// Fall back to the primary only when allowed, or when no replica
+	// qualifies (so read-only clients are never stranded unless ro_fallback
+	// = none explicitly forbids the primary).
+	if r.table.primary != "" && (r.table.roFallback || len(out) == 0) {
 		out = append(out, r.table.primary)
 	}
 	return out, r.table.epoch

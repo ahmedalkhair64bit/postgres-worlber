@@ -1,0 +1,84 @@
+# CI for contrib/worlber_ha: the Go node agent and the SQL extension.
+#
+# agent:     gofmt, go vet, go test -race (seconds; safety rules live here)
+# extension: build PostgreSQL, then the regression test and the TAP cluster
+#            test (three nodes, real agents) through "make check".
+name: worlber_ha
+
+on:
+  pull_request:
+    paths:
+      - 'contrib/worlber_ha/**'
+      - '.github/workflows/worlber-ha-ci.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'contrib/worlber_ha/**'
+      - '.github/workflows/worlber-ha-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worlber-ha-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent:
+    name: agent (go vet + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: contrib/worlber_ha/agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: contrib/worlber_ha/agent/go.mod
+          cache-dependency-path: contrib/worlber_ha/agent/go.sum
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race -count=1 ./...
+
+  extension:
+    name: extension (regress + TAP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: contrib/worlber_ha/agent/go.mod
+          cache-dependency-path: contrib/worlber_ha/agent/go.sum
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bison flex libreadline-dev zlib1g-dev \
+            libicu-dev pkg-config libipc-run-perl
+      - name: Configure
+        run: ./configure --prefix="$RUNNER_TEMP/pg" --enable-tap-tests --enable-cassert --enable-debug --without-llvm
+      - name: Build PostgreSQL
+        run: make -j"$(nproc)" -s
+      - name: Build agent
+        run: make -C contrib/worlber_ha agent
+      - name: make check (regression + TAP)
+        run: make -C contrib/worlber_ha check
+        env:
+          WORLBER_HA_AGENT: ${{ github.workspace }}/contrib/worlber_ha/agent/worlber-ha-agent
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worlber-ha-logs
+          path: |
+            contrib/worlber_ha/regression.diffs
+            contrib/worlber_ha/log/
+            contrib/worlber_ha/tmp_check/log/
+          if-no-files-found: ignore

@@ -47,7 +47,7 @@ DROP EXTENSION worlber_ha;
 -- upgrade path 1.0 -> 1.1
 CREATE EXTENSION worlber_ha VERSION '1.0';
 SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
-ALTER EXTENSION worlber_ha UPDATE TO '1.1';
+ALTER EXTENSION worlber_ha UPDATE TO '1.2';
 SELECT extversion FROM pg_extension WHERE extname = 'worlber_ha';
 SELECT count(*) AS blocked_sessions FROM worlber_ha.blocking;
 

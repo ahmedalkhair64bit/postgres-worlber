@@ -31,6 +31,8 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 
+#include "worlber_ha.h"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "worlber_ha",
 					.version = PG_VERSION
@@ -64,7 +66,30 @@ _PG_init(void)
 							GUC_UNIT_S,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("worlber_ha.fence",
+							 "Stop this server when it is primary and its lease is stale.",
+							 "Turned on by the worlber_ha agent after it writes the first lease.",
+							 &worlber_ha_fence,
+							 false,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("worlber_ha.lease_ttl",
+							"Grace period for a primary that has no lease file yet.",
+							"The lease file carries its own TTL.",
+							&worlber_ha_lease_ttl,
+							10000,
+							1000, 600000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("worlber_ha");
+
+	/* the fence worker needs worlber_ha in shared_preload_libraries */
+	if (process_shared_preload_libraries_in_progress)
+		worlber_ha_register_fence();
 }
 
 /*

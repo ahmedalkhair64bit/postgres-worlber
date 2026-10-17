@@ -85,7 +85,7 @@ func (a *Agent) peerHandler() http.Handler {
 			return
 		}
 		a.recordBeat(hb)
-		writeReply(w, opResult{}, nil)
+		writeReply(w, opResult{Result: map[string]bool{"confirm": a.confirmFor(hb)}}, nil)
 	})
 	mux.HandleFunc("/peer/op/", func(w http.ResponseWriter, r *http.Request) {
 		op := strings.TrimPrefix(r.URL.Path, "/peer/op/")
@@ -132,6 +132,31 @@ func (a *Agent) peerHandler() http.Handler {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		writeReply(w, opResult{Result: a.logs.Tail(clampLines(req.Lines), req.Level)}, nil)
 	})
+	mux.HandleFunc("/peer/reinit", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if a.fsm.Get().RoleOf(a.cfg.Name) != "replica" {
+			writeReply(w, opResult{}, fmt.Errorf("this node is not a replica"))
+			return
+		}
+		a.mu.Lock()
+		a.reinitReason = nonEmpty(req.Reason, "requested")
+		a.mu.Unlock()
+		writeReply(w, opResult{}, nil)
+	})
+	mux.HandleFunc("/peer/fingerprint", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			DB      string `json:"dbname"`
+			Table   string `json:"table"`
+			WaitLSN string `json:"wait_lsn"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		fp, err := a.localFingerprint(r.Context(), req.DB, req.Table, req.WaitLSN)
+		writeReply(w, opResult{Result: fp}, err)
+	})
+	a.canaryHandlers(mux)
 	mux.HandleFunc("/peer/release_hold", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		a.holdUntil = time.Time{}
@@ -144,6 +169,9 @@ func (a *Agent) peerHandler() http.Handler {
 	outer := http.NewServeMux()
 	outer.HandleFunc("/health", a.health)
 	outer.HandleFunc("/health/", a.health)
+	// /peer/join is redeemed with a one-time token, so it is the only peer
+	// endpoint not behind the cluster token (the new node has no token yet).
+	outer.HandleFunc("/peer/join", a.handleJoin)
 	outer.Handle("/", a.requireToken(mux))
 	return outer
 }

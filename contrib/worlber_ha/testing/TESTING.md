@@ -87,6 +87,49 @@ done
 Building behind a TLS-intercepting proxy:
 `LAB_CA_CERT=/path/ca.crt LAB_BUILD_ARGS="--network host" ./lab.sh up`.
 
+### Chaos harness (load + faults, measured RTO/RPO)
+
+`chaos/run.sh` runs a fault scenario under write load and prints a verdict
+per run. Writers use `worlber-ledger` (built from `agent/cmd/worlber-ledger`).
+They write through the read-write listener (port 5000) on all three nodes.
+Every write attempt is logged as one of:
+- **ack**: COMMIT returned OK;
+- **failed**: an error before COMMIT was sent;
+- **unknown**: COMMIT was sent but its result is not known.
+
+Only **ack** rows count as data loss when they are missing.
+
+```bash
+./chaos/run.sh s1 5                     # kill -9 the primary's postmaster, 5 runs
+CHAOS_KEEP_PG=1 ./lab.sh up && ./lab.sh setup
+./chaos/run.sh s2 5                     # kill -9 the primary's agent; PostgreSQL stays up
+CHAOS_SOAK=30m ./chaos/run.sh s7        # no fault: false failovers, report cancellations
+```
+
+| Scenario | Fault | Pass |
+|---|---|---|
+| s1 | `kill -9` of the postmaster on the primary; its agent stays alive | 0 acked rows missing, RTO ≤ `CHAOS_RTO_MAX` (30s) |
+| s2 | `kill -9` of the agent on the primary; PostgreSQL keeps running (like systemd `KillMode=process`) | 0 acked rows missing, 0 acked rows only on the old primary, RTO ≤ 30s. The fence worker should stop the old primary. If it did, the harness starts the old data in isolation to compare its rows: Unix socket only, read-only, `worlber_ha.fence=off`. The verdict records `old_primary_state` |
+| s1late | `kill -9` the postmaster and `SIGSTOP` the agent for `CHAOS_LATE` s (~19) so it cannot restart PostgreSQL near the failover deadline | 0 acked rows missing; no second primary; the woken agent rejoins as a standby |
+| s2b | network partition of the primary **and** `SIGSTOP` a backend so fast shutdown hangs | 0 acked rows missing; every postgres process of the old primary gone (the agent escalates to SIGKILL) |
+| s3 | `docker pause` the whole primary node until the run ends | 0 acked rows missing (the lease clock keeps running while paused) |
+| s4 | network partition of the primary until the run ends | 0 acked rows missing |
+| s5 | kill the synchronous standby, then the primary (two of three nodes gone) | no promotion (no Raft majority), 0 acked rows missing, cluster recovers when a node returns |
+| s9 | `./chaos/run.sh s9`: recreates the lab on the 1.1 agent (built from `origin/master`), then under load upgrades the async replica, rolls it back to 1.1 and forward again, moves sync, upgrades the sync standby, switches over, upgrades the old primary, runs `ALTER EXTENSION worlber_ha UPDATE` | 0 automatic failovers, 0 acknowledged rows lost, fence off on every node until the gate opens, gate opens only after `ALTER EXTENSION`, primary fence `armed` |
+| s10 | `./chaos/run.sh s10`: archive on, a replica stopped, ~320 MB of WAL written so its slot is invalidated (`lost`), replica started again | replica catches up from the archive with no re-seed, `verify_table` matches |
+| s11 | full power loss: `docker kill` all three nodes, start them again after `CHAOS_DOWN` s (20) | cluster healthy again with no manual action, 0 acked rows missing |
+| s12 | network cut between all nodes for `CHAOS_DOWN` s (30), then reconnected | primary fences itself (no majority), cluster healthy again with no manual action, 0 acked rows missing |
+| s7 | none, for `CHAOS_SOAK`; long reports on port 5001. First enables the WAL archive, measures listener vs direct latency (60s each, P7) and a 30s unthrottled WAL burst (archive ceiling, D14); during the soak adds `CHAOS_S7_WAL_MBS` MB/s of WAL and samples the archiver every 30s | 0 acked rows missing, 0 automatic failovers, 0 archive failures, archiver backlog (`.ready` segments) at the end ≤ 8 |
+
+Each run writes `chaos/results/<scenario>-<stamp>-<n>.json`. It holds the
+ledger verdict (`acked`, `acked_missing`, `old_only_acked`, `rto_ms`, ack
+latency p50/p99), the cluster events since the run started, the old and new
+primary, and `pass`.
+
+To check a ledger by hand:
+`worlber-ledger verify --ledger run.ledger --dsn "<new primary>" [--old-dsn "<old primary>"] --fault-at <unix ms>`.
+It exits 1 when the run fails.
+
 ---
 
 ## B. Three real servers (VMs)
@@ -197,7 +240,7 @@ worlber_ha.events` after each step.
 
 | # | Test | How | Expected |
 |---|---|---|---|
-| 1 | Replication | create a table and insert rows on the primary | rows visible on both replicas; `sync_state` = `quorum` for the sync node, `async` for the other |
+| 1 | Replication | create a table and insert rows on the primary | rows visible on both replicas; `sync_state` = `sync` for the sync node, `potential` for the other |
 | 2 | Sync commit | stop the sync replica (`systemctl stop worlber-ha-agent; pg_ctl stop`) and insert | default mode `available`: insert still succeeds; `synchronous_standby_names` becomes empty |
 | 3 | Strict mode | `SELECT worlber_ha.set_config('synchronous_mode','strict')`, then repeat 2 | insert waits until the sync replica is back |
 | 4 | Switchover | `SELECT worlber_ha.switchover('db2')` | db2 primary within seconds, db1 `streaming`, no data lost |

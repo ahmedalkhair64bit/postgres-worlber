@@ -90,3 +90,74 @@ type memSink struct{ bytes.Buffer }
 func (m *memSink) ID() string    { return "mem" }
 func (m *memSink) Cancel() error { return nil }
 func (m *memSink) Close() error  { return nil }
+
+func TestFencingGate(t *testing.T) {
+	f := New()
+	// A bootstrap entry from an older agent (no open_gate) keeps the gate
+	// closed when a new agent replays the log.
+	old := New()
+	if err := applyCmd(t, old, Command{Op: "bootstrap", ClusterName: "c", Node: &Node{Name: "a"}, Time: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if old.Get().FencingGate {
+		t.Fatal("replaying an old bootstrap entry must not open the gate")
+	}
+	if err := applyCmd(t, f, Command{Op: "bootstrap", ClusterName: "c", Node: &Node{Name: "a"}, Time: 1, OpenGate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.Get().FencingGate {
+		t.Fatal("a fresh cluster must open the gate at bootstrap")
+	}
+	// Already open: open_gate is a no-op and never fails.
+	if err := applyCmd(t, f, Command{Op: "open_gate", GateMembers: []string{"a"}}); err != nil {
+		t.Fatalf("open_gate on an open gate: %v", err)
+	}
+
+	// Simulate an upgraded cluster whose gate is still closed.
+	st := f.Get()
+	st.FencingGate = false
+	st.Nodes["b"] = &Node{Name: "b"}
+	g := New()
+	b, _ := json.Marshal(st)
+	if err := g.Restore(io.NopCloser(bytes.NewReader(b))); err != nil {
+		t.Fatal(err)
+	}
+	if g.Get().FencingGate {
+		t.Fatal("restored closed gate came back open")
+	}
+	// Wrong member set (missing b, or a ghost) must be rejected deterministically.
+	if err := applyCmd(t, g, Command{Op: "open_gate", GateMembers: []string{"a"}}); err == nil {
+		t.Fatal("open_gate missing a member must fail")
+	}
+	if err := applyCmd(t, g, Command{Op: "open_gate", GateMembers: []string{"a", "ghost"}}); err == nil {
+		t.Fatal("open_gate with a ghost member must fail")
+	}
+	if g.Get().FencingGate {
+		t.Fatal("gate opened on a bad member set")
+	}
+	if err := applyCmd(t, g, Command{Op: "open_gate", GateMembers: []string{"a", "b"}, Time: 2}); err != nil {
+		t.Fatalf("open_gate: %v", err)
+	}
+	if !g.Get().FencingGate {
+		t.Fatal("gate did not open on the right member set")
+	}
+}
+
+func TestFenceState(t *testing.T) {
+	f := New()
+	if err := applyCmd(t, f, Command{Op: "bootstrap", ClusterName: "prod", SystemID: "1", Node: &Node{Name: "pg1"}, OpenGate: true}); err != nil {
+		t.Fatal(err)
+	}
+	if f.Get().Nodes["pg1"].FenceLoaded {
+		t.Fatal("a new node must not count as fenced")
+	}
+	if err := applyCmd(t, f, Command{Op: "fence_state", Name: "pg1", FenceLoaded: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.Get().Nodes["pg1"].FenceLoaded {
+		t.Fatal("fence_state not applied")
+	}
+	if err := applyCmd(t, f, Command{Op: "fence_state", Name: "nope", FenceLoaded: true}); err == nil {
+		t.Fatal("fence_state for an unknown node must fail")
+	}
+}
