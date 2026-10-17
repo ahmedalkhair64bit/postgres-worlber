@@ -14,6 +14,18 @@
 **Priority:** P2
 **Depends on:** W1 chaos harness, W5 proof view
 
+### Switchover while a standby is still rejoining can hang the old primary's shutdown
+
+**What:** A second switchover (or drill) started a few seconds after the first, while the demoted node is still rejoining, sometimes fails with `stopping old primary: pg_ctl failed ... server does not shut down`. Seen once in TAP (1 of 3 runs): the old primary completed its shutdown checkpoint, then both standbys (one still rejoining) started replication on it, and those walsenders kept the postmaster from exiting.
+
+**Why:** A DBA can run two switchovers back to back. The switchover fails and the old primary stays half shut down until `pg_ctl` is retried or the node is stopped with `immediate`.
+
+**Context:** Found while testing drill() from a non-postgres database (Codex review on the 1.2 PR). The TAP test now waits for both standbys to stream before the second drill. Options: refuse a switchover until every sync standby is streaming, or retry the stop with `immediate` after the checkpoint is written (no data loss: the target already confirmed the LSN).
+
+**Effort:** S (human: M)
+**Priority:** P2
+**Depends on:** -
+
 ### Scheduled production drills
 
 **What:** Run `worlber_ha.drill()` on a schedule (e.g. weekly in a maintenance window) and keep the results in `worlber_ha.proof`.

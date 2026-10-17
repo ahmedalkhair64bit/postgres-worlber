@@ -250,16 +250,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent started", "raft", a.cfg.RaftAddr, "api", a.cfg.APIAddr, "socket", a.cfg.Socket, "witness", a.cfg.Witness)
 
 	var wg sync.WaitGroup
-	wg.Add(5)
-	go func() { defer wg.Done(); a.eventLoop(ctx) }()
-	go func() { defer wg.Done(); a.router.run(ctx) }()
-	go func() { defer wg.Done(); a.heartbeatLoop(ctx) }()
-	go func() { defer wg.Done(); a.reconcileLoop(ctx) }()
-	go func() { defer wg.Done(); a.leaderLoop(ctx) }()
-	go func() { defer wg.Done(); a.verifyLoop(ctx) }()
-	go func() { defer wg.Done(); a.leaseLoop(ctx) }()
-	go func() { defer wg.Done(); a.fencingLoop(ctx) }()
-	go func() { defer wg.Done(); a.retentionLoop(ctx) }()
+	for _, loop := range []func(context.Context){
+		a.eventLoop, a.router.run, a.heartbeatLoop, a.reconcileLoop, a.leaderLoop,
+		a.verifyLoop, a.leaseLoop, a.fencingLoop, a.retentionLoop,
+	} {
+		wg.Add(1)
+		go func() { defer wg.Done(); loop(ctx) }()
+	}
 
 	<-ctx.Done()
 	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

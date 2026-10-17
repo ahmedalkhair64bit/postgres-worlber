@@ -116,9 +116,12 @@ func (a *Agent) leaderOp(ctx context.Context, op string, args json.RawMessage) (
 	case "join_token":
 		return a.joinToken(ctx, args)
 	case "drill":
-		var req struct{ Kind string }
+		var req struct {
+			Kind string `json:"kind"`
+			DB   string `json:"dbname"`
+		}
 		_ = json.Unmarshal(args, &req)
-		return a.drill(ctx, req.Kind)
+		return a.drill(ctx, req.Kind, req.DB)
 	case "join_consume":
 		var req joinRequest
 		if err := json.Unmarshal(args, &req); err != nil {

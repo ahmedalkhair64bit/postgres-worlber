@@ -87,6 +87,15 @@ sub kill_agent
 	delete $agents{$name};
 }
 
+# A test that dies skips the cleanup at the end: never leave agents behind,
+# or they restart PostgreSQL in the next run's data directories.
+END
+{
+	my $exit = $?;
+	kill 'KILL', values %agents;
+	$? = $exit;
+}
+
 # Poll a query on any of the given nodes until it returns the expected value.
 sub poll_cluster
 {
@@ -307,6 +316,59 @@ is($dret, 0, "drill() completes ($derr)");
 poll_cluster("SELECT last_drill_passed::text || ':' || last_drill_canary_present::text || ':' || (last_drill_rto_ms > 0)::text FROM worlber_ha.proof",
 	'true:true:true', [$replica_for_drill], 'proof shows a passing drill, the canary row on the new primary and a measured RTO');
 diag('drill RTO ms: ' . $replica_for_drill->safe_psql('postgres', 'SELECT last_drill_rto_ms FROM worlber_ha.proof'));
+
+# The extension may live in a database other than postgres: the canary row
+# must be written and checked in that database.
+my ($primary_now, $replica_now);
+foreach my $node (@nodes)
+{
+	my ($r, $o) = $node->psql('postgres', 'SELECT pg_is_in_recovery()');
+	next if $r != 0;
+	if ($o eq 'f') { $primary_now = $node; } else { $replica_now //= $node; }
+}
+$primary_now->safe_psql('postgres', 'CREATE DATABASE app');
+$primary_now->safe_psql('app', 'CREATE EXTENSION worlber_ha');
+$replica_now->poll_query_until('app', "SELECT count(*) = 1 FROM pg_extension WHERE extname = 'worlber_ha'")
+  or die 'the app database did not reach the replica';
+# Both standbys streaming again after the first drill (a switchover while a
+# standby is still rejoining is a separate case, see TODOS.md).
+$primary_now->poll_query_until('postgres', "SELECT count(*) = 2 FROM pg_stat_replication WHERE state = 'streaming'")
+  or die 'standbys not streaming before the second drill';
+($dret, $dout, $derr) = $replica_now->psql('app', 'SELECT worlber_ha.drill()');
+is($dret, 0, "drill() completes from a database other than postgres ($derr)");
+poll_cluster("SELECT last_drill_passed::text || ':' || last_drill_canary_present::text || ':' || drill_pass_streak FROM worlber_ha.proof",
+	'true:true:2', [$replica_now], 'the drill from the app database passes');
+$replica_now->poll_query_until('app', 'SELECT count(*) = 1 FROM worlber_ha_internal.canary')
+  or die 'no canary row in app';
+pass('the canary row is written in the database the drill ran in');
+
+# --- WAL archive set on a running cluster (W6) -----------------------------
+# A standby that is already running must get restore_command (reloaded at
+# once) and archive_mode (applied at its next restart), so it archives if it
+# is promoted later.
+# The second drill demoted $primary_now: wait until it streams again, then
+# use the current roles.
+poll_cluster("SELECT count(*) FILTER (WHERE role = 'primary') || ':' || count(*) FILTER (WHERE state = 'streaming') FROM worlber_ha.cluster_status",
+	'1:2', \@nodes, 'one primary and two streaming standbys after the drills');
+my ($arch_primary, $arch_standby);
+foreach my $node (@nodes)
+{
+	my ($r, $o) = $node->psql('postgres', 'SELECT pg_is_in_recovery()');
+	next if $r != 0;
+	if ($o eq 'f') { $arch_primary = $node; } else { $arch_standby //= $node; }
+}
+my $archive_dir = PostgreSQL::Test::Utils::tempdir();
+($ret, $out, $err) = $arch_primary->psql('postgres', "SELECT worlber_ha.set_config('wal_archive_dir', '$archive_dir')");
+is($ret, 0, "wal_archive_dir set on a running cluster ($err)");
+$arch_standby->poll_query_until('postgres', "SELECT current_setting('restore_command') LIKE '%$archive_dir%'")
+  or die 'restore_command not set on the running standby';
+pass('a running standby gets restore_command');
+$arch_standby->poll_query_until('postgres', "SELECT count(*) = 1 FROM pg_file_settings WHERE name = 'archive_mode' AND setting = 'on' AND applied IS NOT TRUE")
+  or die 'archive_mode not set on the running standby';
+pass('a running standby gets archive_mode for its next restart');
+sleep(10);    # several reconcile passes
+is($arch_primary->safe_psql('postgres', "SELECT count(*) <= 3 FROM worlber_ha.events WHERE kind = 'archive_restart_needed'"),
+	't', 'archive_restart_needed is reported once per node, not on every pass');
 
 # --- Cleanup ---------------------------------------------------------------
 kill_agent($_) foreach keys %agents;

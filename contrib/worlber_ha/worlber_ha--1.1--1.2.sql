@@ -224,7 +224,7 @@ CREATE FUNCTION drill(kind text DEFAULT 'switchover')
 RETURNS jsonb
 LANGUAGE sql VOLATILE
 AS $$
-	SELECT @extschema@.call('drill', jsonb_build_object('kind', kind), 900);
+	SELECT @extschema@.call('drill', jsonb_build_object('kind', kind, 'dbname', current_database()), 900);
 $$;
 REVOKE ALL ON FUNCTION drill(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION drill(text) TO worlber_ha_admin;

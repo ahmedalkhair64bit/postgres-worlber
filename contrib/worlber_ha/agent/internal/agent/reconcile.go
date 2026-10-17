@@ -397,6 +397,7 @@ func (a *Agent) reconcileReplica(ctx context.Context, st fsm.State) error {
 			return a.pg.Stop(ctx, "fast")
 		}
 		if h.Running {
+			a.ensureStandbyArchive(ctx, st)
 			return a.followPrimary(ctx, st, h)
 		}
 		return nil

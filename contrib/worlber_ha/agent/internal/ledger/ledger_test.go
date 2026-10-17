@@ -182,3 +182,18 @@ func TestReadKeysFile(t *testing.T) {
 		t.Fatal("bad line accepted")
 	}
 }
+
+// A client that never got an acknowledgement (down for the whole run) must
+// count as unrecovered, not drop out of the RTO.
+func TestSummarizeNeverAcked(t *testing.T) {
+	recs := []Record{
+		{Client: 1, Seq: 1, Out: Ack, End: 1000},
+		{Client: 1, Seq: 2, Out: Ack, End: 3000},
+		{Client: 2, Seq: 1, Out: Failed, End: 1000},
+		{Client: 2, Seq: 2, Out: Unknown, End: 3000},
+	}
+	s := Summarize(recs, 2000)
+	if s.RTOMS == nil || *s.RTOMS != -1 || len(s.Unrecovered) != 1 || s.Unrecovered[0] != 2 {
+		t.Fatalf("got %+v", s)
+	}
+}

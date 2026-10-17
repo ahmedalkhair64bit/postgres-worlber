@@ -18,6 +18,10 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/worlber/worlber-ha-agent/internal/pg"
 )
 
 // drillReceipt is stored as the JSON detail of the drill event.
@@ -31,38 +35,63 @@ type drillReceipt struct {
 	Error         string `json:"error,omitempty"`
 }
 
+// canaryQuery runs one canary statement in db, the database that holds the
+// extension (and so worlber_ha_internal.canary); the agent's own connection
+// is to postgres.
+func (a *Agent) canaryQuery(ctx context.Context, db, sql string, args []any, dest any) error {
+	if db == "" {
+		db = "postgres"
+	}
+	cfg, err := pgx.ParseConfig(pg.ConnInfo("host", a.pg.SocketDir, "port", fmt.Sprint(a.pg.Port), "user", a.pg.User,
+		"dbname", db, "connect_timeout", "5", "application_name", "worlber_ha_drill"))
+	if err != nil {
+		return err
+	}
+	c, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close(context.Background())
+	return c.QueryRow(ctx, sql, args...).Scan(dest)
+}
+
 // localCanaryWrite inserts a canary row on this node's PostgreSQL.
-func (a *Agent) localCanaryWrite(ctx context.Context) (int64, error) {
+func (a *Agent) localCanaryWrite(ctx context.Context, db string) (int64, error) {
 	var id int64
-	err := a.pg.QueryRow(ctx, "INSERT INTO worlber_ha_internal.canary DEFAULT VALUES RETURNING id", nil, &id)
+	err := a.canaryQuery(ctx, db, "INSERT INTO worlber_ha_internal.canary DEFAULT VALUES RETURNING id", nil, &id)
 	return id, err
 }
 
 // localCanaryHas reports whether this node has the canary row with id.
-func (a *Agent) localCanaryHas(ctx context.Context, id int64) (bool, error) {
+func (a *Agent) localCanaryHas(ctx context.Context, db string, id int64) (bool, error) {
 	var ok bool
-	err := a.pg.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM worlber_ha_internal.canary WHERE id = $1)", []any{id}, &ok)
+	err := a.canaryQuery(ctx, db, "SELECT EXISTS (SELECT 1 FROM worlber_ha_internal.canary WHERE id = $1)", []any{id}, &ok)
 	return ok, err
 }
 
 // canaryHandlers serves /peer/canary_write and /peer/canary_check.
 func (a *Agent) canaryHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/peer/canary_write", func(w http.ResponseWriter, r *http.Request) {
-		id, err := a.localCanaryWrite(r.Context())
+		var req struct {
+			DB string `json:"dbname"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		id, err := a.localCanaryWrite(r.Context(), req.DB)
 		writeReply(w, opResult{Result: map[string]int64{"id": id}}, err)
 	})
 	mux.HandleFunc("/peer/canary_check", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			ID int64 `json:"id"`
+			ID int64  `json:"id"`
+			DB string `json:"dbname"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		ok, err := a.localCanaryHas(r.Context(), req.ID)
+		ok, err := a.localCanaryHas(r.Context(), req.DB, req.ID)
 		writeReply(w, opResult{Result: map[string]bool{"present": ok}}, err)
 	})
 }
 
-// drill runs on the leader.
-func (a *Agent) drill(ctx context.Context, kind string) (opResult, error) {
+// drill runs on the leader; db is the database the caller ran drill() in.
+func (a *Agent) drill(ctx context.Context, kind, db string) (opResult, error) {
 	if kind == "" {
 		kind = "switchover"
 	}
@@ -86,7 +115,7 @@ func (a *Agent) drill(ctx context.Context, kind string) (opResult, error) {
 	var w struct {
 		ID int64 `json:"id"`
 	}
-	if err := a.peerPost(ctx, old.APIAddr, "/peer/canary_write", nil, &w); err != nil {
+	if err := a.peerPost(ctx, old.APIAddr, "/peer/canary_write", map[string]string{"dbname": db}, &w); err != nil {
 		return fail(fmt.Errorf("canary write on %s: %w", st.Primary, err))
 	}
 	rc.CanaryID = w.ID
@@ -125,7 +154,7 @@ func (a *Agent) drill(ctx context.Context, kind string) (opResult, error) {
 	var c struct {
 		Present bool `json:"present"`
 	}
-	if err := a.peerPost(ctx, np.APIAddr, "/peer/canary_check", map[string]int64{"id": rc.CanaryID}, &c); err != nil {
+	if err := a.peerPost(ctx, np.APIAddr, "/peer/canary_check", map[string]any{"id": rc.CanaryID, "dbname": db}, &c); err != nil {
 		return fail(fmt.Errorf("canary check on %s: %w", rc.NewPrimary, err))
 	}
 	rc.CanaryPresent = c.Present

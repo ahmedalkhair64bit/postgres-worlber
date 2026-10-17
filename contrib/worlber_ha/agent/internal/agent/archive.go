@@ -97,6 +97,13 @@ func (a *Agent) ensureArchiving(ctx context.Context) (bool, error) {
 		a.log.Info("archive_command set", "dir", dir)
 	}
 	if curMode != "on" && curMode != "always" {
+		// Already written and only waiting for a restart: do not write it
+		// (or report it) again on every reconcile pass.
+		var pending string
+		_ = a.pg.QueryRow(ctx, "SELECT coalesce((SELECT setting FROM pg_file_settings WHERE name = 'archive_mode' ORDER BY seqno DESC LIMIT 1), '')", nil, &pending)
+		if pending == "on" || pending == "always" {
+			return true, nil
+		}
 		if err := a.pg.Exec(ctx, "ALTER SYSTEM SET archive_mode = on"); err != nil {
 			return false, err
 		}
@@ -104,6 +111,32 @@ func (a *Agent) ensureArchiving(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// ensureStandbyArchive keeps a running standby's archive settings current
+// when wal_archive_dir is set or changed later: restore_command (reloadable)
+// now, and archive_mode/archive_command so that a later promotion archives
+// without waiting for another restart.
+func (a *Agent) ensureStandbyArchive(ctx context.Context, st fsm.State) {
+	dir := a.archiveDir(st)
+	if dir == "" {
+		return
+	}
+	var cur string
+	if err := a.pg.QueryRow(ctx, "SELECT current_setting('restore_command')", nil, &cur); err != nil {
+		return
+	}
+	if want := restoreCommand(dir); cur != want {
+		if err := a.pg.Exec(ctx, "ALTER SYSTEM SET restore_command = "+pg.QuoteLiteral(want)); err != nil {
+			a.log.Warn("cannot set restore_command", "error", err)
+			return
+		}
+		_ = a.pg.Exec(ctx, "SELECT pg_reload_conf()")
+		a.log.Info("restore_command set", "dir", dir)
+	}
+	if _, err := a.ensureArchiving(ctx); err != nil {
+		a.log.Warn("cannot configure WAL archiving", "error", err)
+	}
 }
 
 // archiveSettings adds restore_command for standbys when an archive is set.
@@ -117,8 +150,10 @@ func (a *Agent) archiveSettings(st fsm.State, into map[string]*string) {
 	into["restore_command"] = &rc
 }
 
-// retentionLoop prunes the archive from the leader, keeping archive_keep of
-// history (default 7 days), so a crashed member cannot fill it forever.
+// retentionLoop prunes the archive from the primary's agent, keeping
+// archive_keep of history (default 7 days), so a crashed member cannot fill
+// it forever.  Not the Raft leader: a witness can hold leadership and has no
+// archive mounted.
 func (a *Agent) retentionLoop(ctx context.Context) {
 	t := time.NewTicker(10 * time.Minute)
 	defer t.Stop()
@@ -128,7 +163,7 @@ func (a *Agent) retentionLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		if !a.isLeader() || a.cfg.Witness {
+		if a.cfg.Witness || a.fsm.Get().Primary != a.cfg.Name {
 			continue
 		}
 		a.pruneArchive(ctx)

@@ -165,8 +165,10 @@ func Summarize(recs []Record, faultAt int64) Summary {
 	acks := map[int][]int64{}
 	var lat []int64
 	seen := map[Key]bool{}
+	writers := map[int]bool{}
 	for _, r := range recs {
 		s.Attempts++
+		writers[r.Client] = true
 		if seen[r.Key()] {
 			s.DuplicateKey++
 		}
@@ -182,8 +184,11 @@ func Summarize(recs []Record, faultAt int64) Summary {
 			s.Unknown++
 		}
 	}
-	clients := make([]int, 0, len(acks))
-	for c, ts := range acks {
+	// every client that attempted a write, including one never acknowledged
+	// (it must count as unrecovered, not drop out of the RTO)
+	clients := make([]int, 0, len(writers))
+	for c := range writers {
+		ts := acks[c]
 		sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
 		for i := 1; i < len(ts); i++ {
 			if g := ts[i] - ts[i-1]; g > s.MaxAckGapMS {
